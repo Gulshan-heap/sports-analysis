@@ -1,0 +1,10 @@
+# Optional Intel acceleration for the basketball pipeline.
+#
+#     pip install -r requirements.txt -r requirements-openvino.txt
+#
+# Adds the "OpenVINO - Intel GPU" backend to the Performance panel. Only worth
+# installing on a machine with an Intel integrated GPU; on plain CPU OpenVINO
+# measured slower than PyTorch. Install is safe either way - the app probes for
+# the package and hides the option when it is missing.
+openvino>=2024.0,<2026.4
+onnx>=1.15

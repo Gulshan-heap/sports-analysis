@@ -23,6 +23,10 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     --line:        #21262d;
     --text:        #e6edf3;
     --muted:       #8b949e;
+    /* Secondary text. The previous value measured 2.3:1 against the page
+       background - well under the 4.5:1 WCAG AA floor for body text, and
+       genuinely hard to read. This one measures 5.1:1. */
+    --faint:       #7d8590;
     --team1:       #e94560;
     --team2:       #4a90e2;
 }
@@ -51,12 +55,12 @@ section[data-testid="stSidebar"] hr { border-color: var(--line); }
 
 /* -- sport switcher -- */
 .sport-switch-label {
-    color: #484f58 !important;
-    font-size: 0.65rem;
+    color: var(--muted) !important;
+    font-size: 0.72rem;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 1.2px;
-    margin-bottom: 0.15rem;
+    margin-bottom: 0.4rem;
 }
 .brand { text-align: center; padding: 1.1rem 0 0.4rem; }
 .brand-mark { font-size: 2.2rem; line-height: 1; }
@@ -81,7 +85,7 @@ section[data-testid="stSidebar"] hr { border-color: var(--line); }
 .chip.ok  { border-color: #1e4620; }
 .chip.bad { border-color: #f85149; }
 .chip-title { font-size: 0.8rem; font-weight: 700; }
-.chip-sub   { color: #484f58 !important; font-size: 0.68rem; margin-top: 0.15rem; }
+.chip-sub   { color: var(--faint) !important; font-size: 0.7rem; margin-top: 0.15rem; }
 
 /* -- hero banner -- */
 .hero {
@@ -307,6 +311,12 @@ div[data-testid="stMetricValue"] {
     color: var(--text) !important;
     font-size: 1.6rem !important;
     font-weight: 800 !important;
+}
+
+/* -- captions (st.caption) -- */
+div[data-testid="stCaptionContainer"], div[data-testid="stCaptionContainer"] p {
+    color: var(--faint) !important;
+    font-size: 0.76rem !important;
 }
 
 /* -- alert overrides -- */

@@ -34,9 +34,10 @@ matplotlib
 gdown>=5.1.0
 roboflow==1.1.51
 
-# ── optional: Intel GPU / CPU acceleration ───────────────────────────────────
-# Unlocks the "OpenVINO — Intel GPU" backend in the basketball Performance
-# panel. Measured ~5x faster per-model than PyTorch CPU on an Intel iGPU.
-# Safe to omit; the app falls back to PyTorch and hides the option.
-openvino>=2024.0
-onnx
+# ── OpenVINO acceleration is OPTIONAL and deliberately NOT listed here ───────
+# It only pays off on a machine with an Intel iGPU (measured ~5x there;
+# OpenVINO on plain CPU was *slower* than PyTorch). Cloud hosts have no iGPU,
+# so installing it there is ~100 MB of build time for no gain. The app detects
+# its absence and hides the backend option.
+#
+# To enable it locally:  pip install -r requirements-openvino.txt

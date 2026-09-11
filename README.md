@@ -65,7 +65,44 @@ pip install -r requirements.txt
 ```
 
 `ffmpeg` on your PATH is optional but recommended — both sports use it to
-re-encode output to browser-playable H.264.
+re-encode output to browser-playable H.264. (`packages.txt` installs it on
+Streamlit Cloud.)
+
+Optional Intel GPU acceleration, worth it only on a machine with an Intel iGPU:
+
+```bash
+pip install -r requirements-openvino.txt
+```
+
+---
+
+## Deploying
+
+Verified: `requirements.txt` resolves cleanly to 82 packages, and both sport
+pages render without errors when the model weights are absent — which is the
+real cold-start state, since `models/` is gitignored.
+
+Two things to get right:
+
+* **Use Python 3.12.** `torch==2.2.0` publishes wheels for cp38–cp312 only, so
+  a Python 3.13 host fails at install. `.python-version` pins it; on Streamlit
+  Community Cloud also pick 3.12 under *Advanced settings*.
+* **OpenVINO is not in `requirements.txt`** on purpose — cloud hosts have no
+  Intel iGPU, and OpenVINO on plain CPU measured *slower* than PyTorch, so it
+  would be pure build-time cost. The app hides the option when the package is
+  missing.
+
+Two limits worth knowing before you deploy the basketball page:
+
+* The three weight files total **745 MB** and are fetched from Google Drive on
+  first use. On a 1 GB-RAM free tier that is likely to exhaust memory. The page
+  degrades honestly if it fails — the models chip turns red and **Run Analysis**
+  stays disabled — but it will not analyse anything. Smaller weights (or a
+  paid tier) are the real fix.
+* Analysis is CPU-bound there, at roughly the rates in the table below. Cap
+  **Analyse first N seconds** before running anything on a hosted instance.
+
+Football is lighter: one model, and it reads the path from the sidebar.
 
 ---
 

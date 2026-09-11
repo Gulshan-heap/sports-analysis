@@ -89,7 +89,8 @@ for col, option in zip(switch_cols, SPORTS):
 
 spacer_note = ", ".join(f"{s.icon} {s.label}" for s in SPORTS)
 st.markdown(
-    f"<div style='color:#484f58;font-size:0.7rem;margin:-0.3rem 0 1.2rem;'>"
+    f"<div style='color:var(--muted);font-size:0.78rem;"
+    f"margin:-0.2rem 0 1.3rem;'>"
     f"Available: {spacer_note} — each keeps its own settings and results.</div>",
     unsafe_allow_html=True,
 )
@@ -110,7 +111,7 @@ with st.sidebar:
         f"<div class='sport-switch-label'>Analysing</div>"
         f"<div style='color:#e6edf3;font-weight:700;font-size:0.95rem;"
         f"margin-bottom:0.2rem;'>{sport.icon} {sport.label}</div>"
-        f"<div style='color:#484f58;font-size:0.68rem;'>"
+        f"<div style='color:var(--faint);font-size:0.72rem;'>"
         f"Switch sports at the top of the page.</div>",
         unsafe_allow_html=True,
     )
@@ -149,7 +150,7 @@ except Exception as exc:
 with st.sidebar:
     theme.rule()
     st.markdown(
-        "<div style='color:#484f58;font-size:0.68rem;text-align:center;'>"
+        "<div style='color:var(--faint);font-size:0.72rem;text-align:center;'>"
         f"{sport.dirname}</div>",
         unsafe_allow_html=True,
     )
