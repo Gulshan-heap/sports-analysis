@@ -26,8 +26,9 @@ for _p in (ROOT, REPO_ROOT):
         sys.path.insert(0, _p)
 
 from sports_core.theme import (
-    sec, kpi, kpi_grid, chip, spacer, feature_cards,
+    sec, kpi, kpi_grid, chip, spacer, feature_cards, html,
 )
+from sports_core import accel
 
 STATE_KEY = "football_results"
 
@@ -96,7 +97,13 @@ def build_command(input_path, output_raw, args, calib_path):
         cmd += ["--scale", str(args["scale"])]
     if args.get("detect_stride") and args["detect_stride"] > 1:
         cmd += ["--detect-stride", str(args["detect_stride"])]
-    cmd += ["--progress-every", "30"]
+    if args.get("imgsz"):
+        cmd += ["--imgsz", str(args["imgsz"])]
+    if args.get("device"):
+        cmd += ["--device", str(args["device"])]
+    if args.get("task"):
+        cmd += ["--task", str(args["task"])]
+    cmd += ["--progress-every", "10"]
     if args.get("export_csv"):
         cmd += ["--export-csv", args["export_csv"]]
     if args.get("heatmaps_dir"):
@@ -115,6 +122,29 @@ def parse_result_json(lines):
     return None
 
 
+# Library chatter the user can do nothing about — never surfaced in the status
+# panel. The full log is still kept and shown on demand / on failure.
+_NOISE = (
+    "FutureWarning", "DeprecationWarning", "UserWarning", "RuntimeWarning",
+    "warnings.warn", "self.tracker = sv.ByteTrack()", "TracerWarning",
+)
+
+
+def is_noise(line):
+    stripped = line.strip()
+    if not stripped:
+        return True
+    return any(token in line for token in _NOISE)
+
+
+def estimate_runtime(n_frames, stride, imgsz, backend):
+    """Rough seconds of compute for the football pipeline (one detector)."""
+    cost = accel.SECONDS_PER_FRAME.get(backend,
+                                       accel.SECONDS_PER_FRAME[accel.PYTORCH_CPU])
+    scale = (imgsz / 640.0) ** 2
+    return n_frames * (cost["player"] / max(1, stride)) * scale
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,18 +161,50 @@ def _sidebar():
                                        key="fb_model")
             use_cache = st.checkbox("Use cached tracking (same video re-runs)",
                                     value=False, key="fb_cache")
-            max_frames = st.number_input("Max frames (0 = all)", min_value=0,
-                                         value=0, step=50, key="fb_maxframes")
-            scale = st.number_input("Frame scale (1.0 = original)", min_value=0.1,
-                                    max_value=1.0, value=1.0, step=0.1,
-                                    key="fb_scale")
-            detect_stride = st.number_input(
-                "Detect stride (1 = every frame; 3 ≈ 3x faster)",
-                min_value=1, value=1, step=1, key="fb_stride")
             fps = st.number_input("FPS override (0 = auto)", min_value=0, value=0,
                                   step=1, key="fb_fps")
             do_heatmaps = st.checkbox("Generate player heatmaps", value=False,
                                       key="fb_heatmaps")
+
+        with st.expander("🚀 Performance", expanded=True):
+            backends = accel.available_backends()
+            backend = st.selectbox(
+                "Inference backend", [k for k, _ in backends], index=0,
+                format_func=accel.label_for, key="fb_backend",
+                help="OpenVINO runs the same weights on Intel hardware. On an "
+                     "integrated GPU it measured ~5x faster than PyTorch CPU, "
+                     "with matching detections. The first run per resolution "
+                     "converts the model (~20 s), then it is cached.")
+            if accel.is_openvino(backend):
+                cached = accel.cache_size_mb()
+                st.caption(f"Converted models cached: {cached:.0f} MB"
+                           if cached else
+                           "The model is converted on first run, then cached.")
+            elif not accel.openvino_installed():
+                st.caption("Install `openvino` to unlock Intel GPU inference.")
+
+            max_frames = st.number_input(
+                "Max frames (0 = all)", min_value=0, value=0, step=50,
+                key="fb_maxframes",
+                help="The quickest way to get a result out of a long clip.")
+            detect_stride = st.number_input(
+                "Detect every Nth frame", min_value=1, value=1, step=1,
+                key="fb_stride",
+                help="Skipped frames reuse the last known boxes. Roughly Nx "
+                     "faster, but ByteTrack sees bigger jumps and splits "
+                     "players into more IDs — good for a quick look, not for "
+                     "final numbers.")
+            imgsz = st.select_slider(
+                "Detection resolution", options=[320, 416, 512, 640, 960],
+                value=640, key="fb_imgsz",
+                help="YOLO input size. 640 is what the model was trained at; "
+                     "lower is quadratically faster but misses small/distant "
+                     "objects — the ball especially.")
+            scale = st.number_input(
+                "Output frame scale (1.0 = original)", min_value=0.1,
+                max_value=1.0, value=1.0, step=0.1, key="fb_scale",
+                help="Downscales the video itself, so both detection and "
+                     "encoding get cheaper.")
 
         with st.expander("📐 Calibration", expanded=False):
             calib_method = st.radio(
@@ -169,6 +231,8 @@ def _sidebar():
         "fps": fps if fps else None,
         "do_heatmaps": do_heatmaps,
         "calib_method": calib_method,
+        "imgsz": int(imgsz),
+        "backend": backend,
     }
 
 
@@ -237,32 +301,95 @@ def _run_pipeline(input_path, video_name, cfg, calib_corners):
         calib_path = os.path.join(run_dir, f"{video_name}_calib.json")
         build_calibration_json(corners, region_length, region_width, calib_path)
 
+    # Resolve the detector for the chosen backend (OpenVINO converts once,
+    # then is cached). Fall back to PyTorch rather than failing the run.
+    backend = cfg["backend"]
+    model_path, task, device = cfg["model"], None, accel.predict_device(backend)
+    if accel.is_openvino(backend):
+        try:
+            if not accel.is_exported(cfg["model"], cfg["imgsz"]):
+                st.info(f"Converting the detector to OpenVINO for "
+                        f"imgsz {cfg['imgsz']} — one-off, about 20 s.")
+            model_path, task = accel.resolve_model(cfg["model"], cfg["imgsz"],
+                                                   backend)
+        except Exception as exc:
+            st.warning(f"OpenVINO conversion failed ({exc}). "
+                       f"Falling back to PyTorch CPU.")
+            backend = accel.PYTORCH_CPU
+            device = accel.predict_device(backend)
+
     args = dict(cfg)
+    args["model"] = model_path
+    args["task"] = task
+    args["device"] = device
     args["export_csv"] = csv_path
     args["heatmaps_dir"] = heatmaps_dir if cfg["do_heatmaps"] else None
     cmd = build_command(input_path, raw_out, args, calib_path)
 
-    with st.status("Running analysis pipeline…", expanded=True) as status:
-        lines = []
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for stdout_line in iter(proc.stdout.readline, ""):
-            lines.append(stdout_line.rstrip("\n"))
-            status.write("\n".join(lines[-40:]))
-        proc.wait()
-        if proc.returncode != 0:
-            status.update(label="Pipeline failed", state="error")
-            st.error("Pipeline exited with an error:\n\n" + "\n".join(lines[-50:]))
-            return None
-        status.update(label="Pipeline finished", state="complete")
+    # -u so the child's stdout reaches us line by line; warnings off so the
+    # status panel shows pipeline stages, not library deprecation notices.
+    cmd = [cmd[0], "-u"] + cmd[1:]
+    env = dict(os.environ, PYTHONWARNINGS="ignore", PYTHONUNBUFFERED="1")
 
-    with st.spinner("Encoding H.264 for browser playback…"):
-        try:
-            from utils import convert_to_h264
-            convert_to_h264(raw_out, h264_out, fps=cfg.get("fps"))
-        except Exception as exc:            # fall back to showing the raw file
-            st.warning(f"Could not create H.264 preview ({exc}). Showing raw instead.")
-            h264_out = raw_out
+    progress = st.progress(0)
+    status_line = st.empty()
+    lines = []
+
+    def show(pct, msg, detail=""):
+        progress.progress(min(100, max(0, int(pct))))
+        extra = (f"<span style='color:var(--faint);'> — {detail}</span>"
+                 if detail else "")
+        html(f"<div style='color:var(--muted);font-size:0.85rem;"
+             f"margin-top:0.3rem;'>{msg}{extra}</div>", target=status_line)
+
+    show(2, "🚀 Starting pipeline…")
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            env=env)
+    stage_msg = "Starting pipeline…"
+    for raw_line in iter(proc.stdout.readline, ""):
+        line = raw_line.rstrip("\n")
+        lines.append(line)
+
+        if line.startswith("@STAGE "):
+            try:
+                d = json.loads(line[len("@STAGE "):])
+                stage_msg = d.get("msg", stage_msg)
+                show(d.get("pct", 0), f"⚙️ {stage_msg}")
+            except json.JSONDecodeError:
+                pass
+        elif line.startswith("@PROGRESS "):
+            try:
+                d = json.loads(line[len("@PROGRESS "):])
+                frame, total = d.get("frame", 0), d.get("total") or 0
+                pct = 12 + (frame / total * 74) if total else 50
+                detail = (f"frame {frame:,}/{total:,} · {d.get('fps', 0)} fps"
+                          + (f" · ~{d.get('eta', 0)}s left" if d.get("eta") else ""))
+                show(pct, "🏃 Tracking players, ball & possession", detail)
+            except json.JSONDecodeError:
+                pass
+
+    proc.wait()
+    if proc.returncode != 0:
+        progress.empty()
+        status_line.empty()
+        real = [x for x in lines if not is_noise(x)]
+        st.error("Pipeline exited with an error.")
+        with st.expander("Pipeline log", expanded=True):
+            st.code("\n".join(real[-60:]) or "\n".join(lines[-60:]), language="text")
+        return None
+
+    show(96, "🎬 Encoding H.264 for browser playback…")
+    try:
+        from utils import convert_to_h264
+        convert_to_h264(raw_out, h264_out, fps=cfg.get("fps"))
+    except Exception as exc:                # fall back to showing the raw file
+        st.warning(f"Could not create H.264 preview ({exc}). Showing raw instead.")
+        h264_out = raw_out
+
+    progress.progress(100)
+    progress.empty()
+    status_line.empty()
 
     return {
         "raw_out": raw_out,
@@ -272,6 +399,11 @@ def _run_pipeline(input_path, video_name, cfg, calib_corners):
         "heatmaps_dir": heatmaps_dir if cfg["do_heatmaps"] else None,
         "stats": parse_result_json(lines),
         "log": lines,
+        "settings": {
+            "backend": accel.label_for(backend),
+            "imgsz": cfg["imgsz"],
+            "detect_stride": cfg.get("detect_stride") or 1,
+        },
     }
 
 
@@ -297,7 +429,7 @@ def _render_results(r):
         )
 
         if pct1 + pct2 > 0:
-            st.markdown(f"""
+            html(f"""
             <div class="team-strip">
                 <div class="team-strip-header">
                     <div class="t1">🔴 Team 1 — {pct1}%</div>
@@ -308,7 +440,7 @@ def _render_results(r):
                     <div class="cb-t1" style="width:{pct1}%"></div>
                     <div class="cb-t2" style="width:{pct2}%"></div>
                 </div>
-            </div>""", unsafe_allow_html=True)
+            </div>""")
 
         sec("⚙️", "Pipeline Performance")
         m1, m2, m3, m4 = st.columns(4)
@@ -319,8 +451,21 @@ def _render_results(r):
         m3.metric("Run time", f"{stats.get('total_time_s', 0)} s")
         m4.metric("Video fps", stats.get("video_fps", 0))
 
+        cfg_used = r.get("settings") or {}
+        if cfg_used:
+            st.caption(
+                f"{cfg_used.get('backend', '—')} · imgsz "
+                f"{cfg_used.get('imgsz', 640)} · detect stride "
+                f"{cfg_used.get('detect_stride', 1)}")
+
         with st.expander("Full run stats"):
             st.json(stats)
+
+    # The raw pipeline log is available but never shown by default — it is
+    # mostly library warnings the user cannot act on.
+    if r.get("log"):
+        with st.expander("Pipeline log"):
+            st.code("\n".join(r["log"][-200:]), language="text")
 
     # ── per-frame data ───────────────────────────────────────────────────────
     if os.path.exists(r["csv_path"]):
@@ -380,14 +525,14 @@ def _render_landing():
 
     spacer()
     sec("🚀", "Getting Started")
-    st.markdown("""
+    html("""
     <div class="steps">
         <b>1.</b> Upload a football video above<br>
         <b>2.</b> Point <b>Detection</b> at your trained weights (defaults to <code>models/best.pt</code>)<br>
         <b>3.</b> Optionally set the four pitch corners under <b>Calibration</b> for speed &amp; distance<br>
         <b>4.</b> Hit <span class="hl">Run Analysis</span> — the pipeline logs stream straight into the page<br>
         <b>5.</b> Watch the annotated video, then export the CSV and heatmaps
-    </div>""", unsafe_allow_html=True)
+    </div>""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,12 +551,12 @@ def render(sport=None):
     )
 
     if uploaded is None:
-        st.markdown("""
+        html("""
         <div class="upload-zone">
             <div style="font-size:2.5rem;margin-bottom:0.6rem;">📹</div>
             <div style="color:#e6edf3;font-weight:600;font-size:1rem;">Drop your video here</div>
             <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem;">MP4 · AVI · MOV · MKV · WEBM</div>
-        </div>""", unsafe_allow_html=True)
+        </div>""")
         if STATE_KEY in st.session_state:
             _render_results(st.session_state[STATE_KEY])
         else:
@@ -437,11 +582,28 @@ def render(sport=None):
         run_analysis = st.button("🚀  Run Analysis", type="primary",
                                  use_container_width=True, key="fb_run")
     with right:
-        if calib_corners is None:
-            st.info("ℹ️ No calibration — boxes, team colours and the ball "
-                    "triangle still render, but speed & distance are skipped.")
+        cap = cv2.VideoCapture(input_path)
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        if cfg["max_frames"]:
+            n_frames = min(n_frames, cfg["max_frames"])
+        est = estimate_runtime(n_frames, cfg["detect_stride"] or 1,
+                               cfg["imgsz"], cfg["backend"])
+        eta = f"{est/60:.1f} min" if est > 60 else f"{est:.0f} s"
+
+        if not os.path.exists(cfg["model"]):
+            st.error(f"⚠️ Detector not found at `{cfg['model']}` — set the path "
+                     f"under **Detection** in the sidebar.")
+        elif est > 240:
+            st.warning(f"⏱️ ~{eta} of work for {n_frames:,} frames on "
+                       f"**{accel.label_for(cfg['backend'])}**. Cap **Max "
+                       f"frames**, raise **Detect every Nth frame** or lower "
+                       f"**Detection resolution** to bring this down.")
         else:
-            st.success("✅ Pitch calibrated — speed & distance will be computed.")
+            st.success(f"✅ {n_frames:,} frames on "
+                       f"**{accel.label_for(cfg['backend'])}** — roughly {eta}."
+                       + ("" if calib_corners is not None else
+                          " No calibration, so speed & distance are skipped."))
 
     if run_analysis:
         results = _run_pipeline(input_path, video_name, cfg, calib_corners)

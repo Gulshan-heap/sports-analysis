@@ -208,6 +208,28 @@ Accuracy caveat: the ball detector finds slightly fewer low-confidence boxes
 through OpenVINO (39 vs 44 over 8 frames). This was **identical at FP32 and
 FP16**, so it is a decode/NMS difference, not a precision loss.
 
+### Football
+
+The football page has the same **Performance** panel — backend, max frames,
+detect stride, detection resolution, output scale. Its detector
+(`best.pt`, YOLOv5l, 53 M params) already ran one frame at a time, which is
+exactly what a static batch-1 OpenVINO export wants.
+
+Measured on 40 frames of `08fd33_4.mp4`:
+
+| backend | total | processing | detection |
+| --- | ---: | ---: | ---: |
+| PyTorch CPU | 127 s | 0.32 fps | 0.34 fps |
+| OpenVINO iGPU | **61 s** | **0.66 fps** | **0.77 fps** |
+
+**2.1x end-to-end, 2.26x on detection.** The gap is smaller than basketball's
+because football also runs optical-flow camera-movement estimation and
+annotation per frame, and those stay on the CPU.
+
+Team numbering may swap between runs (Team 1 ↔ Team 2). That is the KMeans
+jersey clustering picking its cluster order, not a backend difference — the
+possession split itself was 70/30 both times.
+
 ---
 
 ## Adding a third sport

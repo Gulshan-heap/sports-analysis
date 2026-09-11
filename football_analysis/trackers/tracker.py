@@ -10,8 +10,11 @@ from utils import get_center_of_bbox, get_bbox_width, get_foot_position
 class Tracker:
     def __init__(self, model_path, class_map=None, conf=0.1, imgsz=640,
                  device=None, half=None, batch_size=20, verbose=False,
-                 detect_stride=1):
-        self.model = YOLO(model_path)
+                 detect_stride=1, task=None):
+        # `task` must be passed explicitly for non-PyTorch weights: ultralytics
+        # cannot infer it from an OpenVINO IR directory and defaults to
+        # "detect", which would silently mis-read any other kind of model.
+        self.model = YOLO(model_path, task=task) if task else YOLO(model_path)
         self.tracker = sv.ByteTrack()
         self.conf = conf
         self.imgsz = imgsz

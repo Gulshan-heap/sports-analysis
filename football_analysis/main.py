@@ -85,7 +85,26 @@ def build_parser():
                         help="Print a progress line every N frames (0 = silent)")
     parser.add_argument("--no-hud", dest="show_hud", action="store_false",
                         help="Do not burn the live fps/progress overlay into the output video")
+    parser.add_argument("--imgsz", type=int, default=640,
+                        help="YOLO input size. Lower is quadratically faster but "
+                             "misses small/distant objects (the ball especially)")
+    parser.add_argument("--device", default=None,
+                        help="Inference device: cpu, cuda, or intel:gpu for an "
+                             "OpenVINO IR model")
+    parser.add_argument("--task", default=None,
+                        help="Model task (detect/pose/...). Required when --model "
+                             "points at an exported OpenVINO directory")
     return parser
+
+
+def emit(kind, **fields):
+    """Machine-readable progress line for the Streamlit front-end.
+
+    The UI shows these as named stages with a progress bar instead of dumping
+    raw stdout (which is full of library warnings nobody can act on). Humans
+    running the CLI still get the plain-text lines below.
+    """
+    print(f"@{kind} " + json.dumps(fields), flush=True)
 
 
 def run_pipeline(args):
@@ -106,6 +125,7 @@ def run_pipeline(args):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
+    emit("STAGE", pct=3, msg="Opening video")
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {args.input}")
@@ -122,7 +142,9 @@ def run_pipeline(args):
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
                              fps, (out_w, out_h))
 
-    tracker = Tracker(args.model, detect_stride=args.detect_stride)
+    emit("STAGE", pct=8, msg="Loading detector")
+    tracker = Tracker(args.model, detect_stride=args.detect_stride,
+                      imgsz=args.imgsz, device=args.device, task=args.task)
 
     # Cached raw tracks from a previous run (bbox only). Everything derived
     # (positions, teams, speed, possession) is recomputed deterministically
@@ -147,6 +169,7 @@ def run_pipeline(args):
     last_team = 1
     team_ball_control = []
 
+    emit("STAGE", pct=12, msg="Analysing frames", total=total_frames)
     frame_num = 0
     detect_seconds = 0.0
     detect_count = 0
@@ -239,12 +262,16 @@ def run_pipeline(args):
             proc_fps = frame_num / elapsed if elapsed else 0.0
             eta = ((total_frames - frame_num) / proc_fps
                    if proc_fps and total_frames else 0.0)
+            emit("PROGRESS", frame=frame_num, total=total_frames,
+                 fps=round(proc_fps, 1), eta=round(eta),
+                 t1=possession_counts.get(1, 0), t2=possession_counts.get(2, 0))
             print(f"frame {frame_num}/{total_frames or '?'} | {proc_fps:.1f} fps | "
                   f"eta {eta:.0f}s | possession T1 {possession_counts.get(1, 0)} "
                   f"T2 {possession_counts.get(2, 0)}")
 
     cap.release()
     writer.release()
+    emit("STAGE", pct=88, msg="Calculating speed & distance")
     speed_estimator.finalize(tracks)
 
     if frame_num == 0:
@@ -262,11 +289,13 @@ def run_pipeline(args):
     team_ball_control = np.array(team_ball_control)
 
     if args.export_csv:
+        emit("STAGE", pct=92, msg="Exporting per-frame CSV")
         export_frame_data_csv(tracks, team_ball_control, output_path=args.export_csv)
     team_possession_summary(team_ball_control)
 
     heatmap_paths = []
     if args.heatmaps_dir:
+        emit("STAGE", pct=95, msg="Generating player heatmaps")
         os.makedirs(args.heatmaps_dir, exist_ok=True)
         player_ids = set()
         for frame in tracks['players']:
@@ -294,6 +323,7 @@ def run_pipeline(args):
         "video_name": video_name,
     }
     # Machine-readable summary line, parsed by the Streamlit app for metrics.
+    emit("STAGE", pct=99, msg="Finishing up")
     print("RESULT_JSON: " + json.dumps(stats))
 
     return stats

@@ -31,7 +31,7 @@ for _p in (ROOT, REPO_ROOT):
         sys.path.insert(0, _p)
 
 from sports_core.theme import (
-    sec, kpi, kpi_grid, chip, spacer, feature_cards,
+    sec, kpi, kpi_grid, chip, spacer, feature_cards, html,
 )
 from sports_core import accel
 
@@ -761,7 +761,7 @@ def _render_results(r):
 
     if r.get("team_colors"):
         (r1, g1, b1), (r2, g2, b2) = r["team_colors"][1], r["team_colors"][2]
-        st.markdown(f"""
+        html(f"""
         <div style="display:flex;gap:1rem;margin:0.5rem 0;">
           <div style="display:flex;align-items:center;gap:0.4rem;">
             <div style="width:16px;height:16px;border-radius:4px;
@@ -773,7 +773,7 @@ def _render_results(r):
                         background:rgb({r2},{g2},{b2});border:1px solid #30363d;"></div>
             <span style="color:#8b949e;font-size:0.8rem;">Team 2 detected color</span>
           </div>
-        </div>""", unsafe_allow_html=True)
+        </div>""")
 
     stats = compute_stats(
         r["ball_aquisition"], r["player_assignment"],
@@ -796,7 +796,7 @@ def _render_results(r):
     )
 
     if pct1 + pct2 > 0:
-        st.markdown(f"""
+        html(f"""
         <div class="team-strip">
             <div class="team-strip-header">
                 <div class="t1">🔴 Team 1 — {pct1}%</div>
@@ -823,7 +823,7 @@ def _render_results(r):
                 <span class="stat-val blue">{p2 + i2}</span>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
     # ── ball control over time ───────────────────────────────────────────────
     sec("⏱️", "Ball Control Over Time")
@@ -995,7 +995,7 @@ def _render_results(r):
         team_str = ("🔴 Team 1" if team_holding == 1
                     else "🔵 Team 2" if team_holding == 2 else "—")
 
-        st.markdown(f"""
+        html(f"""
         <div class="frame-meta">
             <div class="fm-item"><div class="fm-label">Frame</div>
                 <div class="fm-value">{frame_idx} / {max_f}</div></div>
@@ -1005,7 +1005,7 @@ def _render_results(r):
                 <div class="fm-value">{team_str}</div></div>
             <div class="fm-item"><div class="fm-label">Event</div>
                 <div class="fm-value">{event_str}</div></div>
-        </div>""", unsafe_allow_html=True)
+        </div>""")
 
     # ── export ───────────────────────────────────────────────────────────────
     if df is not None:
@@ -1047,14 +1047,14 @@ def _render_landing():
 
     spacer()
     sec("🚀", "Getting Started")
-    st.markdown("""
+    html("""
     <div class="steps">
         <b>1.</b> Upload a basketball video above<br>
         <b>2.</b> Model weights load automatically — nothing to configure<br>
         <b>3.</b> Team colors are detected automatically from the footage<br>
         <b>4.</b> Hit <span class="hl">Run Analysis</span> and wait for the pipeline to finish<br>
         <b>5.</b> Explore the annotated video, stats charts, and frame explorer
-    </div>""", unsafe_allow_html=True)
+    </div>""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1075,12 +1075,12 @@ def render(sport=None):
     video_path = None
     fingerprint = None
     if uploaded is None:
-        st.markdown("""
+        html("""
         <div class="upload-zone">
             <div style="font-size:2.5rem;margin-bottom:0.6rem;">📹</div>
             <div style="color:#e6edf3;font-weight:600;font-size:1rem;">Drop your video here</div>
             <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem;">MP4 · AVI · MOV · MKV</div>
-        </div>""", unsafe_allow_html=True)
+        </div>""")
     else:
         data = uploaded.getvalue()
         fingerprint = video_fingerprint(data)

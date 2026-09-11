@@ -55,12 +55,12 @@ section[data-testid="stSidebar"] hr { border-color: var(--line); }
 
 /* -- sport switcher -- */
 .sport-switch-label {
-    color: var(--muted) !important;
-    font-size: 0.72rem;
+    color: #aeb8c8 !important;
+    font-size: 0.8rem;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 1.2px;
-    margin-bottom: 0.4rem;
+    margin-bottom: 0.5rem;
 }
 .brand { text-align: center; padding: 1.1rem 0 0.4rem; }
 .brand-mark { font-size: 2.2rem; line-height: 1; }
@@ -341,6 +341,27 @@ def _soften(hex_colour, alpha=0.28):
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def html(markup, target=None):
+    """
+    Collapse HTML to a single line and render it.
+
+    Streamlit runs markdown over the string before treating it as HTML. A blank
+    line followed by 4-space-indented text is markdown's fenceless code block,
+    so a KPI card with an empty sub-label used to emit a blank line and turn
+    every card after it into visible `<div ...>` source. Stripping the
+    indentation and the newlines removes the whole class of bug.
+
+    `target` may be any Streamlit container (an `st.empty()` placeholder, a
+    column, …); it defaults to the page.
+    """
+    (target or st).markdown(compact(markup), unsafe_allow_html=True)
+
+
+def compact(markup):
+    """One line, no leading whitespace, no blank lines. See html()."""
+    return "".join(line.strip() for line in markup.splitlines() if line.strip())
+
+
 def inject(sport):
     """Apply the shared stylesheet, skinned with this sport's accent colour."""
     css = (_CSS
@@ -354,35 +375,34 @@ def inject(sport):
 
 def sec(icon, label):
     """A section heading with a trailing rule."""
-    st.markdown(f"""
+    html(f"""
     <div class="sec-head">
         <span class="sec-head-icon">{icon}</span>
         <span>{label}</span>
         <div class="sec-head-line"></div>
-    </div>""", unsafe_allow_html=True)
+    </div>""")
 
 
 def kpi(label, value, sub="", colour="gray"):
     """Return the HTML for one KPI card (compose several inside `.kpi-grid`)."""
     sub_html = f"<div class='kpi-sub'>{sub}</div>" if sub else ""
-    return f"""
+    return compact(f"""
     <div class="kpi {colour}">
         <div class="kpi-label">{label}</div>
         <div class="kpi-value">{value}</div>
         {sub_html}
-    </div>"""
+    </div>""")
 
 
 def kpi_grid(*cards):
     """Render a row of `kpi()` cards."""
-    st.markdown(f"<div class='kpi-grid'>{''.join(cards)}</div>",
-                unsafe_allow_html=True)
+    html(f"<div class='kpi-grid'>{''.join(cards)}</div>")
 
 
 def hero(sport):
     """The page banner for a sport."""
     badges = "".join(f"<span class='badge'>{b}</span>" for b in sport.badges)
-    st.markdown(f"""
+    html(f"""
     <div class="hero">
         <div class="hero-icon">{sport.icon}</div>
         <div class="hero-text">
@@ -391,17 +411,17 @@ def hero(sport):
             <div class="hero-badges">{badges}</div>
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
 def chip(title, sub="", colour="#8b949e", state=""):
     """A small bordered status card for the sidebar."""
     sub_html = f"<div class='chip-sub'>{sub}</div>" if sub else ""
-    st.markdown(f"""
+    html(f"""
     <div class="chip {state}">
         <div class="chip-title" style="color:{colour};">{title}</div>
         {sub_html}
-    </div>""", unsafe_allow_html=True)
+    </div>""")
 
 
 def rule():
@@ -418,10 +438,10 @@ def feature_cards(features, per_row=4):
     cols = st.columns(per_row)
     for i, (icon, title, desc) in enumerate(features):
         with cols[i % per_row]:
-            st.markdown(f"""
+            html(f"""
             <div class="feat-card">
                 <div class="feat-icon">{icon}</div>
                 <div class="feat-title">{title}</div>
                 <div class="feat-desc">{desc}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>""")
             spacer("0.6rem")

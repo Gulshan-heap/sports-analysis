@@ -34,3 +34,5 @@ Thumbs.db
 
 # ── streamlit ────────────────────────────────────────────────────────────────
 .streamlit/secrets.toml
+
+kernel.errors.txt
