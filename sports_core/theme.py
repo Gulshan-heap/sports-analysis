@@ -31,8 +31,23 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     --team2:       #4a90e2;
 }
 
-/* -- hide default streamlit chrome -- */
-#MainMenu, footer, header { visibility: hidden; }
+/* -- hide default streamlit chrome --
+   `header` itself is kept: it's also where Streamlit renders the
+   ">>" button that re-opens a collapsed sidebar. Hiding the whole
+   header (as before) hid that button too, leaving no way back in
+   once the sidebar was collapsed. Instead we blank out the header's
+   own toolbar (hamburger menu / "Deploy" button) and let the
+   re-expand control show through. */
+#MainMenu, footer { visibility: hidden; }
+header[data-testid="stHeader"] {
+    background: transparent;
+    box-shadow: none;
+}
+header[data-testid="stHeader"] [data-testid="stStatusWidget"],
+header[data-testid="stHeader"] [data-testid="stToolbarActions"],
+header[data-testid="stHeader"] [data-testid="stAppDeployButton"] {
+    visibility: hidden;
+}
 
 /* -- page background -- */
 .stApp { background: var(--bg); }
