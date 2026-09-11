@@ -28,7 +28,7 @@ for _p in (ROOT, REPO_ROOT):
 from sports_core.theme import (
     sec, kpi, kpi_grid, chip, spacer, feature_cards, html,
 )
-from sports_core import accel
+from sports_core import accel, weights
 
 STATE_KEY = "football_results"
 
@@ -39,6 +39,30 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEFAULT_MODEL = os.path.join(MODEL_DIR, "best.pt")
+
+# `models/` is gitignored, so a clone or a cloud deploy has no best.pt. The
+# detector is fetched from here on first use and cached, the way basketball's
+# weights are — nothing to configure for the app to work on a fresh deploy.
+#
+# Override without touching code by setting `football_model_url` in
+# .streamlit/secrets.toml, or the FOOTBALL_MODEL_URL environment variable, or
+# by pasting a link in the sidebar.
+MODEL_URL_KEY = "football_model_url"
+DEFAULT_MODEL_URL = (
+    "https://drive.google.com/file/d/"
+    "1bzmKYxV4I89zbA28eHdN8LJswiMR3P36/view?usp=sharing"
+)
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_model_ready(local_path, url):
+    """
+    Guarantee a detector checkpoint exists, returning (path, source).
+
+    Cached per (local_path, url) so a rerun never re-downloads.
+    """
+    return weights.resolve_single(local_path, url, cache_name="football",
+                                  filename="best.pt")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,14 +174,38 @@ def estimate_runtime(n_frames, stride, imgsz, backend):
 # ─────────────────────────────────────────────────────────────────────────────
 def _sidebar():
     with st.sidebar:
-        model_ok = os.path.exists(DEFAULT_MODEL)
-        chip("✅ Detector found" if model_ok else "⚠️ models/best.pt missing",
-             os.path.relpath(DEFAULT_MODEL, ROOT),
-             "#3fb950" if model_ok else "#f85149",
-             state="ok" if model_ok else "bad")
+        # Resolve the detector: local file, else a configured/pasted URL that
+        # gets downloaded once and cached.
+        configured = weights.configured_url(MODEL_URL_KEY, DEFAULT_MODEL_URL)
+        pasted = st.session_state.get("fb_model_url", "").strip()
+        with st.spinner("Fetching detector weights (first run only)…"):
+            resolved, source, why = ensure_model_ready(DEFAULT_MODEL,
+                                                       pasted or configured)
+
+        if source == "local":
+            chip("✅ Detector found", os.path.relpath(resolved, ROOT),
+                 "#3fb950", state="ok")
+        elif source == "downloaded":
+            size = os.path.getsize(resolved) / 1e6
+            chip("✅ Detector downloaded", f"{size:.0f} MB, cached",
+                 "#3fb950", state="ok")
+        else:
+            chip("⚠️ Detector weights unavailable",
+                 "see the reason below", "#f85149", state="bad")
+
+        if source == "missing":
+            if why:
+                st.caption(f"Download failed — {why}")
+            st.text_input(
+                "Weights URL (.pt or Google Drive link)",
+                key="fb_model_url", placeholder="https://…",
+                help="The built-in download could not be reached. Paste a link "
+                     "here, or set `football_model_url` in Streamlit secrets / "
+                     "FOOTBALL_MODEL_URL to override it permanently.")
 
         with st.expander("🎯 Detection", expanded=True):
-            model_path = st.text_input("YOLO model (.pt)", value=DEFAULT_MODEL,
+            model_path = st.text_input("YOLO model (.pt)",
+                                       value=resolved or DEFAULT_MODEL,
                                        key="fb_model")
             use_cache = st.checkbox("Use cached tracking (same video re-runs)",
                                     value=False, key="fb_cache")
@@ -206,16 +254,6 @@ def _sidebar():
                 help="Downscales the video itself, so both detection and "
                      "encoding get cheaper.")
 
-        with st.expander("📐 Calibration", expanded=False):
-            calib_method = st.radio(
-                "Calibration method",
-                ["None (boxes only)", "Manual corners"],
-                index=0,
-                key="fb_calib_method",
-                help="Speed/distance labels only appear for players inside the "
-                     "calibrated region. Without calibration, boxes, team "
-                     "colors and the ball triangle still render.")
-
         if STATE_KEY in st.session_state:
             if st.button("🗑️ Clear results", use_container_width=True,
                          key="fb_clear"):
@@ -223,14 +261,17 @@ def _sidebar():
                 st.rerun()
 
     return {
-        "model": model_path,
+        # The text input keeps whatever it was first rendered with, so if the
+        # weights only arrived on a later run, fall back to the resolved path
+        # rather than handing the pipeline a path that does not exist.
+        "model": model_path if os.path.exists(model_path)
+                 else (resolved or model_path),
         "use_cache": use_cache,
         "max_frames": int(max_frames) if max_frames else None,
         "scale": scale if scale and scale != 1.0 else None,
         "detect_stride": int(detect_stride) if detect_stride else None,
         "fps": fps if fps else None,
         "do_heatmaps": do_heatmaps,
-        "calib_method": calib_method,
         "imgsz": int(imgsz),
         "backend": backend,
     }
@@ -571,10 +612,22 @@ def render(sport=None):
              caption="First frame (calibration preview)",
              use_container_width=True)
 
+    sec("📐", "Calibration — needed for speed & distance")
+    calib_method = st.radio(
+        "Calibration method",
+        ["None (boxes only)", "Manual corners"],
+        index=0, horizontal=True, key="fb_calib_method",
+        label_visibility="collapsed",
+        help="Speed and distance are computed by mapping pitch pixels to real "
+             "metres, which needs the four pitch corners. Without it, boxes, "
+             "team colours and the ball triangle still render.")
+
     calib_corners = None
-    if cfg["calib_method"] == "Manual corners":
-        sec("📐", "Calibration")
+    if calib_method == "Manual corners":
         calib_corners = _calibration_corners(frame0, preview_scale)
+    else:
+        st.caption("Pick **Manual corners** above to mark the four pitch "
+                   "corners and get per-player speed (km/h) and distance (m).")
 
     spacer("0.5rem")
     left, right = st.columns([1, 3])

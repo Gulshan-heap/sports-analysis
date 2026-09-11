@@ -130,6 +130,45 @@ Two more deliberate choices:
   and OpenVINO on plain CPU measured *slower* than PyTorch, so it would be pure
   build-time cost. The app hides the option when the package is missing.
 
+### Model weights on a deploy
+
+`models/` is gitignored, so **no weights reach the deployed app**. The two
+sports now handle that the same way:
+
+| Sport | Where weights come from |
+| --- | --- |
+| Basketball | Public Google Drive folder (3 checkpoints, ~745 MB), fetched on first use and cached |
+| Football | Public Google Drive file (`best.pt`, 107 MB), fetched on first use and cached |
+
+Football previously had *no* fetch mechanism at all — it just expected
+`football_analysis/models/best.pt` to exist, which is why the deployed app
+showed its detector as missing while basketball's were ready. Both now download
+on demand, so **a fresh deploy needs no configuration**.
+
+Resolution order for football, first hit wins:
+
+1. `football_analysis/models/best.pt` on disk
+2. a previous download in the cache (outside the repo, survives redeploys)
+3. `football_model_url` in Streamlit secrets, or `FOOTBALL_MODEL_URL` in the
+   environment
+4. the built-in Drive link in `football_analysis/ui.py`
+
+To point it at different weights without touching code, add to
+**Settings → Secrets**:
+
+```toml
+football_model_url = "https://drive.google.com/file/d/<id>/view?usp=sharing"
+```
+
+A Drive folder link, a Drive file link, or any direct `.pt` URL all work. If a
+fetch fails the sidebar shows the actual reason and offers a field to paste an
+alternative, rather than a bare red chip.
+
+One gotcha worth recording: `gdown` removed the `fuzzy=True` argument in
+version 6, and `requirements.txt` allows both 5.x and 6.x. `weights.py`
+therefore extracts the Drive file id itself and passes `id=`, which every
+version accepts.
+
 Two limits worth knowing before you deploy the basketball page:
 
 * The three weight files total **745 MB** and are fetched from Google Drive on
