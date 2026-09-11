@@ -331,12 +331,18 @@ detection, plus a frame explorer and CSV/JSON export.
 Model weights are fetched automatically from Google Drive on first run and
 cached; local `models/*.pt` files take priority if present.
 
+#### Basketball Output
+Example outputs from the basketball analysis pipeline:
+
 ### ⚽ Football
 Runs the pipeline as a **subprocess** (`main.py`), streaming its logs live into
 the page. YOLO + ByteTrack tracking, KMeans jersey-colour team assignment,
 nearest-player ball possession, optical-flow camera-movement compensation,
 perspective transform from four pitch corners, speed & distance, optional
 per-player heatmaps, and per-frame CSV export.
+
+#### Football Output
+Example outputs from the football analysis pipeline:
 
 Point the **Detection** panel at your trained weights (defaults to
 `football_analysis/models/best.pt`).
