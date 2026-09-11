@@ -78,19 +78,57 @@ pip install -r requirements-openvino.txt
 
 ## Deploying
 
-Verified: `requirements.txt` resolves cleanly to 82 packages, and both sport
-pages render without errors when the model weights are absent — which is the
-real cold-start state, since `models/` is gitignored.
+`requirements.txt` is verified to resolve on **Python 3.12, 3.13 and 3.14**
+(with `uv`, the resolver Streamlit Cloud uses), and both sport pages render
+without errors when the model weights are absent — the real cold-start state,
+since `models/` is gitignored.
 
-Two things to get right:
+**The host picks the Python version, not you.** A first deploy attempt failed
+because Streamlit Cloud built on Python 3.14 — `.python-version` is *not* read
+by that platform (you can select the version under *Advanced settings*, but the
+requirements must survive whatever gets chosen). The failure cascaded:
 
-* **Use Python 3.12.** `torch==2.2.0` publishes wheels for cp38–cp312 only, so
-  a Python 3.13 host fails at install. `.python-version` pins it; on Streamlit
-  Community Cloud also pick 3.12 under *Advanced settings*.
-* **OpenVINO is not in `requirements.txt`** on purpose — cloud hosts have no
-  Intel iGPU, and OpenVINO on plain CPU measured *slower* than PyTorch, so it
-  would be pure build-time cost. The app hides the option when the package is
-  missing.
+1. `supervision==0.25.1` carries `numpy>=2.1.0 ; python_version >= "3.13"`,
+   which contradicted a flat `numpy<2.0` pin → resolution failed outright.
+2. pip then fell back and tried to build `numpy 1.26.4` from source, because
+   numpy 1.x publishes no cp313/cp314 wheels. That is what made the build hang
+   for ~45 minutes before dying.
+
+So the numpy/torch pair is now chosen by marker rather than assumed:
+
+```
+numpy>=1.26,<2.0 ; python_version < "3.13"     torch==2.2.0 ; python_version < "3.13"
+numpy>=2.1       ; python_version >= "3.13"    torch>=2.9   ; python_version >= "3.13"
+```
+
+Python ≤3.12 keeps the exact pairing that runs locally (torch 2.2.0 is built
+against the NumPy 1.x C API, so it *must* have numpy<2). Python 3.13+ gets the
+numpy-2 stack with a torch new enough to match.
+
+Everything else moved from exact pins to **bounded ranges**. The exact pins had
+no wheels on newer interpreters, and removing the bounds entirely is worse — an
+unbounded resolve jumps to pandas 3, transformers 5 and OpenCV 5, which resolve
+happily and then break at runtime. Every version inside the current ranges has
+a cp314-installable wheel (exact, `abi3`, or universal), so the bounds cost
+nothing.
+
+Resolved versions per interpreter:
+
+| | py3.12 | py3.13 | py3.14 |
+| --- | --- | --- | --- |
+| numpy | 1.26.4 | 2.5.3 | 2.5.3 |
+| torch | 2.2.0 | 2.14.0 | 2.14.0 |
+| pandas | 2.3.3 | 2.3.3 | 2.3.3 |
+| opencv-headless | 4.11 | 4.14 | 4.14 |
+| transformers | 4.57.6 | 4.57.6 | 4.57.6 |
+
+Two more deliberate choices:
+
+* **`roboflow` was dropped.** It is imported only by the training notebooks,
+  never by the app — `pip install roboflow` if you go back to training.
+* **OpenVINO is not in `requirements.txt`.** Cloud hosts have no Intel iGPU,
+  and OpenVINO on plain CPU measured *slower* than PyTorch, so it would be pure
+  build-time cost. The app hides the option when the package is missing.
 
 Two limits worth knowing before you deploy the basketball page:
 

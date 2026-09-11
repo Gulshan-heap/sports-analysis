@@ -1,28 +1,44 @@
 # Sports Analysis — unified dependencies
-# Union of basketball_analysis/requirements.txt and
-# football_analysis/requirements.txt. Where both pinned a package, the
-# stricter (basketball) pin is kept — it satisfies football's minimums.
+# Union of the basketball and football projects.
+#
+# Resolution is verified against Python 3.12, 3.13 and 3.14 (see the note on
+# the numpy/torch pair below) because hosted platforms pick the interpreter,
+# not us — Streamlit Cloud used 3.14 even with a .python-version file present.
 
 # ── app ──────────────────────────────────────────────────────────────────────
 streamlit>=1.30
 altair>=5.0
 
 # ── core numerics ────────────────────────────────────────────────────────────
-# torch 2.2.x is built against the NumPy 1.x C API — with numpy>=2 every
-# torch<->numpy conversion raises "Numpy is not available". Keep <2.0
-# unless torch is upgraded too.
-numpy>=1.26,<2.0
-pandas==2.2.3
+# torch 2.2.x is compiled against the NumPy 1.x C API: pair it with numpy<2 or
+# every torch<->numpy conversion raises "Numpy is not available".
+#
+# Python 3.13+ cannot use that pairing at all — numpy 1.26 publishes no cp313 /
+# cp314 wheels (a source build is what made the cloud deploy hang for 45 min),
+# and supervision requires numpy>=2.1 there. So newer interpreters get the
+# numpy-2 stack with a torch new enough to match it.
+numpy>=1.26,<2.0 ; python_version < "3.13"
+numpy>=2.1       ; python_version >= "3.13"
+torch==2.2.0     ; python_version < "3.13"
+torch>=2.9       ; python_version >= "3.13"
+
+# Upper bounds keep us inside the majors this code was written against.
+# Without them the resolver happily jumps to pandas 3 / transformers 5 /
+# OpenCV 5, which resolve fine and then break at runtime. Every version in
+# these ranges has a cp314-installable wheel (verified: exact, abi3 or
+# universal), so the bounds cost nothing on newer interpreters.
+pandas>=2.2,<3
 scipy
 scikit-learn>=1.3.0
-Pillow==11.1.0
+Pillow>=11.0,<13
 
 # ── vision / tracking ────────────────────────────────────────────────────────
-opencv-python-headless==4.10.0.84
-ultralytics==8.3.67
-supervision==0.25.1
-torch==2.2.0
-transformers==4.46.3          # Fashion-CLIP team assignment (basketball)
+# Ranges rather than exact pins: the exact pins had no wheels on newer Pythons,
+# which forced slow source builds and then failed.
+opencv-python-headless>=4.10,<5
+ultralytics>=8.3.67,<9
+supervision>=0.25.1,<0.31
+transformers>=4.46,<5       # Fashion-CLIP team assignment (basketball)
 
 # ── video encoding ───────────────────────────────────────────────────────────
 av
@@ -32,12 +48,11 @@ matplotlib
 
 # ── model fetching ───────────────────────────────────────────────────────────
 gdown>=5.1.0
-roboflow==1.1.51
 
 # ── OpenVINO acceleration is OPTIONAL and deliberately NOT listed here ───────
 # It only pays off on a machine with an Intel iGPU (measured ~5x there;
 # OpenVINO on plain CPU was *slower* than PyTorch). Cloud hosts have no iGPU,
-# so installing it there is ~100 MB of build time for no gain. The app detects
-# its absence and hides the backend option.
+# so installing it there is build time for no gain. The app detects its
+# absence and hides the backend option.
 #
 # To enable it locally:  pip install -r requirements-openvino.txt
