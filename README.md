@@ -341,8 +341,10 @@ nearest-player ball possession, optical-flow camera-movement compensation,
 perspective transform from four pitch corners, speed & distance, optional
 per-player heatmaps, and per-frame CSV export.
 
+Point the **Detection** panel at your trained weights (defaults to
+`football_analysis/models/best.pt`).
+
 #### Football Output
 Example outputs from the football analysis pipeline:
 
-Point the **Detection** panel at your trained weights (defaults to
-`football_analysis/models/best.pt`).
+
