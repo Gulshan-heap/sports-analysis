@@ -158,6 +158,14 @@ def run_pipeline(args):
     tracks = {"players": [], "referees": [], "ball": []}
 
     pixel_vertices, region_length, region_width = load_calibration(args.calib, args.input)
+
+    # Calibration is marked on full-resolution frames, but --scale resizes every
+    # frame before tracking, so the vertices have to move with them. Without
+    # this, --scale 0.5 silently halves every distance and speed.
+    if pixel_vertices is not None and (out_w, out_h) != (src_w, src_h):
+        sx, sy = out_w / float(src_w), out_h / float(src_h)
+        pixel_vertices = [[x * sx, y * sy] for x, y in pixel_vertices]
+
     view_transformer = ViewTransformer(pixel_vertices, region_length, region_width)
 
     camera_estimator = None

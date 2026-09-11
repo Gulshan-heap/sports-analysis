@@ -309,6 +309,74 @@ possession split itself was 70/30 both times.
 
 ---
 
+## Automatic pitch calibration (football)
+
+Speed and distance need the four pitch corners, so image pixels can be mapped
+to metres. **Automatic** is now the default and finds them without typing
+coordinates ([football_analysis/pitch_calibration.py](football_analysis/pitch_calibration.py)):
+
+1. Segment the grass, learning the turf hue *from the frame* rather than using
+   a fixed green range — a hard-coded range fails under floodlights and on
+   colour-graded broadcast feeds.
+2. Take the largest grass component, close the holes players and lines punch in
+   it, and reduce the convex hull to a quadrilateral.
+3. Where the painted lines are visible, refine by intersecting the outermost
+   near-horizontal and near-vertical lines — lines are a sharper boundary than
+   the grass edge, which bleeds into the crowd.
+4. Sample five frames across the clip and keep the most confident result, so a
+   replay or a close-up cannot ruin it.
+
+### It does not work for all cases, and here is exactly why
+
+Two different things are needed, and only one is recoverable from video:
+
+* **The shape** (where the corners are) — solved reliably.
+* **The scale** (what those corners span in metres) — *not* solvable from one
+  frame. The identical trapezoid could be a full pitch or one half of it, and
+  **speed and distance scale linearly with that number**.
+
+On the bundled clip the camera is zoomed in, so three of the four corners run
+off the frame — the pitch continues out of shot. The detector reports this
+honestly instead of hiding it:
+
+| | zoomed-in clip | same pitch, fully in shot |
+| --- | --- | --- |
+| corners found | yes | yes |
+| corners actually in shot | **1 of 4** | 4 of 4 |
+| confidence | **25–35%** | **99%** |
+| span note | `region-clipped` | `assumed-full-pitch` |
+
+The confidence score is deliberately penalised per off-frame corner. Without
+that term a zoomed view scored 99% while describing a region whose size is
+unknowable — confident and wrong is worse than uncertain.
+
+So: **Automatic removes the pixel-typing, not the judgement.** When corners are
+clipped the UI says so, keeps 105 × 68 m only as a labelled default, and asks
+you to enter the span you can actually see. Switching to **Manual corners**
+starts pre-filled with the automatic result, so it is a starting point rather
+than a rewrite.
+
+### Speed sanity check
+
+After a run the results panel compares the 90th-percentile speed against a
+human ceiling (~37 km/h; the check trips at 45). It uses p90 rather than the
+max because the extreme tail is dominated by ByteTrack identity switches, which
+teleport a player and register as a huge instantaneous speed — blaming
+calibration for that would be wrong, so the warning names both causes.
+
+On the bundled clip: median 11 km/h, p90 38 km/h — plausible, no warning. The
+*max* was 96 km/h, which is exactly the tracking-noise tail the check is built
+to ignore.
+
+### Fixed along the way
+
+`--scale` resized every frame but left the calibration vertices alone, so
+`--scale 0.5` silently halved every distance and speed. The vertices now scale
+with the frames. Verified: max speed 95.6 km/h at scale 1.0 vs 109.1 at scale
+0.5 — a 1.14x ratio rather than the 2x it was before.
+
+---
+
 ## Adding a third sport
 
 1. Drop the project folder in next to the others.

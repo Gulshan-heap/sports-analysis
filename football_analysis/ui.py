@@ -161,6 +161,28 @@ def is_noise(line):
     return any(token in line for token in _NOISE)
 
 
+@st.cache_data(show_spinner=False)
+def detect_pitch(video_path, _stamp):
+    """
+    Automatic pitch detection, cached per (video, mtime).
+
+    `_stamp` is only there to key the cache on file identity; detection reads
+    several frames, so it must not rerun on every widget interaction.
+    """
+    import pitch_calibration as pitch
+    corners, confidence, info = pitch.detect_from_video(video_path, samples=5)
+
+    frame = None
+    if corners is not None:
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(info.get("frame_index", 0)))
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            frame = None
+    return corners, confidence, info, frame
+
+
 def estimate_runtime(n_frames, stride, imgsz, backend):
     """Rough seconds of compute for the football pipeline (one detector)."""
     cost = accel.SECONDS_PER_FRAME.get(backend,
@@ -324,6 +346,83 @@ def _calibration_corners(frame0, preview_scale):
     return corners, region_length, region_width
 
 
+def _auto_calibration(input_path, preview_scale):
+    """
+    Detect the pitch corners automatically and let the user accept or adjust.
+
+    Returns (corners, region_length, region_width) in ORIGINAL frame
+    coordinates — the same shape `_calibration_corners` returns — or None when
+    detection failed.
+    """
+    import pitch_calibration as pitch
+
+    stamp = os.path.getmtime(input_path) if os.path.exists(input_path) else 0
+    with st.spinner("Detecting the pitch…"):
+        corners, confidence, info, frame = detect_pitch(input_path, stamp)
+
+    if corners is None:
+        st.warning(f"⚠️ Could not detect the pitch — "
+                   f"{info.get('reason') or 'no pitch-like surface found'}. "
+                   f"Switch to **Manual corners**, or run without calibration.")
+        return None
+
+    shape = frame.shape if frame is not None else (1, 1, 3)
+    clipped = pitch.clipped_edges(corners, shape)
+    length, width, note = pitch.guess_region_size(corners, shape)
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.image(cv2.cvtColor(pitch.draw_overlay(frame, corners, confidence),
+                              cv2.COLOR_BGR2RGB),
+                 caption=f"Detected pitch region — {info.get('method')} "
+                         f"(frame {info.get('frame_index', 0)})",
+                 use_container_width=True)
+
+    with right:
+        grade = ("Good" if confidence >= 0.7 else
+                 "Usable" if confidence >= 0.45 else "Low")
+        colour = ("#3fb950" if confidence >= 0.7 else
+                  "#d29922" if confidence >= 0.45 else "#f85149")
+        kpi_grid(
+            kpi("Confidence", f"{confidence:.0%}", grade, "accent"),
+            kpi("Pitch corners seen", f"{4 - clipped}/4",
+                "rest run off-frame" if clipped else "all in shot",
+                "green" if clipped == 0 else "gray"),
+        )
+        html(f"<div style='color:{colour};font-size:0.8rem;font-weight:600;'>"
+             f"{grade} detection</div>")
+
+        st.markdown("**Real-world span of that region**")
+        c1, c2 = st.columns(2)
+        length = c1.number_input("Length (m)", 1.0, 300.0, value=float(length),
+                                 key="fb_auto_len")
+        width = c2.number_input("Width (m)", 1.0, 300.0, value=float(width),
+                                key="fb_auto_wid")
+
+    if note == "region-clipped":
+        st.warning(
+            f"⚠️ Only {4 - clipped} of the 4 pitch corners are in shot — the "
+            f"pitch continues past the frame edge. The *shape* above is right, "
+            f"but its real-world size cannot be measured from the video, and "
+            f"**speed and distance scale directly with the two numbers above**. "
+            f"105 x 68 m is the full-pitch default; for a view like this, enter "
+            f"the span you can actually see (one half is roughly 52 x 68 m)."
+        )
+    else:
+        st.success("✅ All four pitch corners are in shot, so 105 x 68 m is a "
+                   "safe default for a standard pitch.")
+
+    # Seed the manual inputs from this detection, so switching to
+    # "Manual corners" starts from the automatic result instead of from
+    # scratch. Manual works in preview coordinates, hence the scaling.
+    for key, value in zip(("fb_tlx", "fb_tly", "fb_trx", "fb_try",
+                           "fb_brx", "fb_bry", "fb_blx", "fb_bly"),
+                          [c for xy in corners for c in xy]):
+        st.session_state.setdefault(key, int(value * preview_scale))
+
+    return corners, length, width
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,6 +547,44 @@ def _run_pipeline(input_path, video_name, cfg, calib_corners):
     }
 
 
+# A footballer's top speed is ~37 km/h (elite sprinters reach ~36 in a match).
+# We compare against a generous ceiling and use the 90th percentile rather than
+# the max: the extreme tail is dominated by ByteTrack identity switches, which
+# teleport a player and produce a huge instantaneous speed. Blaming calibration
+# for that would be wrong, so the message names both possible causes.
+HUMAN_SPRINT_CEILING_KMH = 45.0
+
+
+def _speed_sanity_check(df):
+    """Flag speeds that are not physically possible, and say what to do."""
+    if "speed" not in df.columns:
+        return
+    speeds = pd.to_numeric(df["speed"], errors="coerce").dropna()
+    speeds = speeds[speeds > 0]
+    if len(speeds) < 20:
+        return
+
+    median, p90 = float(speeds.median()), float(speeds.quantile(0.90))
+    if p90 <= HUMAN_SPRINT_CEILING_KMH:
+        st.caption(f"Speed sanity check: median {median:.1f} km/h, "
+                   f"90th percentile {p90:.1f} km/h — physically plausible.")
+        return
+
+    st.warning("\n\n".join([
+        f"⚠️ Speeds look too high: 90th percentile is **{p90:.0f} km/h** "
+        f"(a footballer tops out near 37). Two things cause this, and both "
+        f"are worth checking:",
+
+        "1. **The calibrated span is too large.** Speed scales directly with "
+        "the metres you entered under Calibration — try the span you can "
+        "actually see rather than a full 105 x 68 m pitch.",
+
+        "2. **Tracking is fragmenting IDs.** If **Detect every Nth frame** is "
+        "above 1, ByteTrack sees bigger jumps and swaps identities, which "
+        "registers as a teleport. Set it back to 1 for final numbers.",
+    ]))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,6 +650,7 @@ def _render_results(r):
         sec("📈", "Tracked Data")
         try:
             df = pd.read_csv(r["csv_path"])
+            _speed_sanity_check(df)
             st.dataframe(df.head(500), use_container_width=True, hide_index=True)
             st.caption(f"Showing the first {min(len(df), 500):,} of {len(df):,} rows "
                        f"— download the full CSV below.")
@@ -615,19 +753,22 @@ def render(sport=None):
     sec("📐", "Calibration — needed for speed & distance")
     calib_method = st.radio(
         "Calibration method",
-        ["None (boxes only)", "Manual corners"],
-        index=0, horizontal=True, key="fb_calib_method",
+        ["None (boxes only)", "Automatic (detect pitch)", "Manual corners"],
+        index=1, horizontal=True, key="fb_calib_method",
         label_visibility="collapsed",
-        help="Speed and distance are computed by mapping pitch pixels to real "
-             "metres, which needs the four pitch corners. Without it, boxes, "
-             "team colours and the ball triangle still render.")
+        help="Speed and distance come from mapping pitch pixels to real metres, "
+             "which needs the four pitch corners. Automatic finds them from the "
+             "grass and the painted lines; Manual lets you type them. Without "
+             "either, boxes, team colours and the ball triangle still render.")
 
     calib_corners = None
-    if calib_method == "Manual corners":
+    if calib_method == "Automatic (detect pitch)":
+        calib_corners = _auto_calibration(input_path, preview_scale)
+    elif calib_method == "Manual corners":
         calib_corners = _calibration_corners(frame0, preview_scale)
     else:
-        st.caption("Pick **Manual corners** above to mark the four pitch "
-                   "corners and get per-player speed (km/h) and distance (m).")
+        st.caption("Pick **Automatic** above and the pitch corners are found "
+                   "for you — no pixel coordinates to type.")
 
     spacer("0.5rem")
     left, right = st.columns([1, 3])
