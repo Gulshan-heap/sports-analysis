@@ -11,11 +11,18 @@ class CourtKeypointDetector:
     The CourtKeypointDetector class uses a YOLO model to detect court keypoints in image frames. 
     It also provides functionality to draw these detected keypoints on the frames.
     """
-    def __init__(self, model_path, device=None, imgsz=None):
+    def __init__(self, model_path, device=None, imgsz=None,
+                 task=None, batch_size=20):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = YOLO(model_path)
-        self.model.to(self.device)
+        self.model = YOLO(model_path, task=task) if task else YOLO(model_path)
+        try:
+            self.model.to(self.device)
+        except Exception:
+            # Non-PyTorch backend (e.g. an OpenVINO IR directory) — there is no
+            # tensor to move; the device is selected per predict() call instead.
+            pass
         self.imgsz = imgsz
+        self.batch_size = batch_size
     
     def get_court_keypoints(self, frames,read_from_stub=False, stub_path=None):
         """
@@ -37,7 +44,7 @@ class CourtKeypointDetector:
             if len(court_keypoints) == len(frames):
                 return court_keypoints
         
-        batch_size=20
+        batch_size = self.batch_size
         court_keypoints = []
         for i in range(0,len(frames),batch_size):
             detections_batch = self.model.predict(

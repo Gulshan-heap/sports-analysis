@@ -33,6 +33,7 @@ for _p in (ROOT, REPO_ROOT):
 from sports_core.theme import (
     sec, kpi, kpi_grid, chip, spacer, feature_cards,
 )
+from sports_core import accel
 
 STATE_KEY = "basketball_results"
 
@@ -48,10 +49,9 @@ DEFAULT_DRIVE_FOLDER_URL = (
 )
 
 
-# Rough CPU cost per frame, per model, at imgsz=640 — measured on a 2-core
-# i3-1115G4. Only used to warn the user before a long run; the real numbers are
-# measured during the run and shown in the results.
-CPU_SECONDS_PER_FRAME = {"player": 0.9, "ball": 1.0, "court": 1.7}
+# Per-model per-frame cost estimates live in sports_core.accel, keyed by
+# backend — they differ by an order of magnitude between PyTorch CPU and an
+# OpenVINO export running on the Intel iGPU.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,12 +132,13 @@ def scatter_strided(sampled, stride, total):
     return out
 
 
-def estimate_runtime(n_frames, stride, kp_every, imgsz):
+def estimate_runtime(n_frames, stride, kp_every, imgsz, backend):
     """Very rough seconds-of-compute estimate, scaled for resolution."""
+    cost = accel.SECONDS_PER_FRAME.get(backend,
+                                       accel.SECONDS_PER_FRAME[accel.PYTORCH_CPU])
     scale = (imgsz / 640.0) ** 2
     per_frame = (
-        (CPU_SECONDS_PER_FRAME["player"] + CPU_SECONDS_PER_FRAME["ball"]) / stride
-        + CPU_SECONDS_PER_FRAME["court"] / kp_every
+        (cost["player"] + cost["ball"]) / stride + cost["court"] / kp_every
     ) * scale
     return n_frames * per_frame
 
@@ -393,7 +394,26 @@ def _sidebar():
                                                 key="bb_t2")
 
         with st.expander("🚀 Performance", expanded=(device == "cpu")):
-            if device == "cpu":
+            backends = accel.available_backends()
+            keys = [k for k, _ in backends]
+            backend = st.selectbox(
+                "Inference backend", keys, index=0,
+                format_func=accel.label_for, key="bb_backend",
+                help="OpenVINO runs the same weights on Intel hardware. On the "
+                     "integrated GPU it measured ~5x faster than PyTorch CPU "
+                     "here, with matching detections. The first run per "
+                     "resolution converts the models (~30-60 s), then it is "
+                     "cached.")
+            if accel.is_openvino(backend):
+                cached = accel.cache_size_mb()
+                st.caption(
+                    f"Converted models cached: {cached:.0f} MB in `{accel.CACHE_DIR}`"
+                    if cached else
+                    "Models will be converted on the first run and cached.")
+            elif not accel.openvino_installed():
+                st.caption("Install `openvino` to unlock Intel GPU inference.")
+
+            if device == "cpu" and not accel.is_openvino(backend):
                 st.caption("Detection runs on CPU here — three YOLO models over "
                            "every frame is the whole cost. These controls trade "
                            "a little accuracy for a lot of speed.")
@@ -468,6 +488,7 @@ def _sidebar():
         "detect_stride": int(detect_stride),
         "keypoint_every": int(keypoint_every),
         "imgsz": int(imgsz),
+        "backend": backend,
     }
 
 
@@ -501,8 +522,9 @@ def _run_pipeline(video_path, cfg):
 
     # Cache detections per (video content, settings) so re-running the same clip
     # is instant, and so two different videos can never share a cache entry.
-    stub_dir = os.path.join(cfg["stub_dir"],
-                            f"{cfg['fingerprint']}_s{stride}k{kp_every}i{imgsz}")
+    stub_dir = os.path.join(
+        cfg["stub_dir"],
+        f"{cfg['fingerprint']}_s{stride}k{kp_every}i{imgsz}_{cfg['backend']}")
     os.makedirs(stub_dir, exist_ok=True)
 
     prog = st.progress(0)
@@ -532,11 +554,46 @@ def _run_pipeline(video_path, cfg):
     total_frames = len(video_frames)
     done("read")
 
-    upd(10, f"🔍 Initialising detectors on {cfg['device_name']}…")
-    player_tracker = PlayerTracker(cfg["player_model"], device=device, imgsz=imgsz)
-    ball_tracker = BallTracker(cfg["ball_model"], device=device, imgsz=imgsz)
-    court_kp_det = CourtKeypointDetector(cfg["court_model"], device=device,
-                                         imgsz=imgsz)
+    # Resolve the three checkpoints for the chosen backend. OpenVINO converts
+    # on first use (slow once, then cached); if that fails for any reason we
+    # fall back to PyTorch rather than failing the run.
+    backend = cfg["backend"]
+    if accel.is_openvino(backend):
+        resolved = {}
+        try:
+            for role, pt in (("player", cfg["player_model"]),
+                             ("ball", cfg["ball_model"]),
+                             ("court", cfg["court_model"])):
+                if not accel.is_exported(pt, imgsz):
+                    upd(10, f"⚙️ Converting {role} model to OpenVINO "
+                            f"(one-off, ~30 s)…")
+                resolved[role] = accel.resolve_model(pt, imgsz, backend)
+        except Exception as exc:
+            st.warning(f"OpenVINO conversion failed ({exc}). "
+                       f"Falling back to PyTorch CPU.")
+            backend = accel.PYTORCH_CPU
+            resolved = None
+    else:
+        resolved = None
+
+    if resolved is None:
+        resolved = {"player": (cfg["player_model"], None),
+                    "ball": (cfg["ball_model"], None),
+                    "court": (cfg["court_model"], None)}
+
+    pred_device = accel.predict_device(backend)
+    batch = accel.batch_size_for(backend)
+
+    upd(10, f"🔍 Initialising detectors — {accel.label_for(backend)}…")
+    player_tracker = PlayerTracker(resolved["player"][0], device=pred_device,
+                                   imgsz=imgsz, task=resolved["player"][1],
+                                   batch_size=batch)
+    ball_tracker = BallTracker(resolved["ball"][0], device=pred_device,
+                               imgsz=imgsz, task=resolved["ball"][1],
+                               batch_size=batch)
+    court_kp_det = CourtKeypointDetector(resolved["court"][0], device=pred_device,
+                                         imgsz=imgsz, task=resolved["court"][1],
+                                         batch_size=batch)
 
     # Detect on a subsampled frame list, then hold each result until the next
     # sample. The court detector gets its own, much coarser interval.
@@ -680,6 +737,7 @@ def _run_pipeline(video_path, cfg):
             "detect_stride": stride,
             "keypoint_every": kp_every,
             "imgsz": imgsz,
+            "backend": accel.label_for(backend),
             "device": cfg["device_name"],
             "frames_detected": len(det_frames),
             "keypoint_frames": len(kp_frames),
@@ -1046,7 +1104,8 @@ def render(sport=None):
         if cfg["max_seconds"]:
             n_frames = min(n_frames, int(cfg["max_seconds"] * src_fps))
         est = estimate_runtime(n_frames, cfg["detect_stride"],
-                               cfg["keypoint_every"], cfg["imgsz"])
+                               cfg["keypoint_every"], cfg["imgsz"],
+                               cfg["backend"])
 
         left, right = st.columns([1, 3])
         with left:
@@ -1058,7 +1117,7 @@ def render(sport=None):
             if missing_models:
                 st.warning("⚠️ Model weights could not be loaded automatically. "
                            "Please check your connection and reload the app.")
-            elif cfg["device"] == "cpu" and est > 240:
+            elif est > 240:
                 st.warning(
                     f"⏱️ ~{est/60:.0f} min of CPU work for {n_frames} frames. "
                     f"Raise **Detect every Nth frame**, lower **Detection "
@@ -1067,7 +1126,8 @@ def render(sport=None):
             else:
                 eta = f"{est/60:.1f} min" if est > 60 else f"{est:.0f} s"
                 st.success(f"✅ Models loaded — {n_frames} frames on "
-                           f"**{cfg['device_name']}**, roughly {eta}")
+                           f"**{accel.label_for(cfg['backend'])}**, "
+                           f"roughly {eta}")
 
         if run_analysis:
             try:

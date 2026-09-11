@@ -8,7 +8,10 @@ streamlit>=1.30
 altair>=5.0
 
 # ── core numerics ────────────────────────────────────────────────────────────
-numpy>=2.1.0,<2.4.0
+# torch 2.2.x is built against the NumPy 1.x C API — with numpy>=2 every
+# torch<->numpy conversion raises "Numpy is not available". Keep <2.0
+# unless torch is upgraded too.
+numpy>=1.26,<2.0
 pandas==2.2.3
 scipy
 scikit-learn>=1.3.0
@@ -30,3 +33,10 @@ matplotlib
 # ── model fetching ───────────────────────────────────────────────────────────
 gdown>=5.1.0
 roboflow==1.1.51
+
+# ── optional: Intel GPU / CPU acceleration ───────────────────────────────────
+# Unlocks the "OpenVINO — Intel GPU" backend in the basketball Performance
+# panel. Measured ~5x faster per-model than PyTorch CPU on an Intel iGPU.
+# Safe to omit; the app falls back to PyTorch and hides the option.
+openvino>=2024.0
+onnx

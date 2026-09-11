@@ -47,8 +47,8 @@ The only new file inside each is `ui.py`.
 
 | Command | What you get |
 | --- | --- |
-| `streamlit run app.py` | Both sports, switchable from the sidebar |
-| `streamlit run app.py` then `?sport=football` | Deep-link straight to a sport |
+| `streamlit run app.py` | Both sports — switch with the buttons at the top of the page |
+| `streamlit run app.py` then `?sport=football` | Deep-link straight to a sport (optional; the buttons do the same) |
 | `streamlit run basketball_analysis/app.py` | Basketball only |
 | `streamlit run football_analysis/app.py` | Football only |
 | `python basketball_analysis/main.py <video>` | Basketball CLI (unchanged) |
@@ -135,10 +135,41 @@ so re-running the same clip is instant. The cache used to be keyed by filename
 alone, which meant a different video with the same frame count would silently
 reuse the previous video's tracks.
 
-There is **no NVIDIA GPU** on this machine, so CUDA is not an option. The
-remaining hardware-level lever is an **OpenVINO export** (`model.export(
-format="openvino")`, then load the exported directory) — it targets Intel CPUs
-and iGPUs and is typically 2–3x faster than PyTorch CPU for the same weights.
+### Inference backends (OpenVINO)
+
+There is no NVIDIA GPU here, but the **Intel iGPU** can run the models via an
+OpenVINO export of the same weights. Pick it under **Performance → Inference
+backend**; the first run per resolution converts the models (~50 s total) and
+caches the result, after which it is instant.
+
+Per-model, 720p at `imgsz=640`:
+
+| model | task | PyTorch CPU | OpenVINO iGPU | speedup |
+| --- | --- | ---: | ---: | ---: |
+| `player_detector` (YOLOv5l6u, 86 M) | detect | 1.11 s/f | 0.23 s/f | **4.9x** |
+| `ball_detector_model` (YOLOv5l6u, 86 M) | detect | 1.16 s/f | 0.21 s/f | **5.6x** |
+| `court_keypoint_detector` (YOLOv8x-pose, 70 M) | pose | 2.37 s/f | 0.37 s/f | **6.3x** |
+
+End-to-end on a 117-frame clip (court key-points every 30th frame), detection
+went from **343 s → 118 s, a 2.9x speedup**, with possession and ball-possession
+frame counts identical and total distance within 2.8% (94.1 m → 91.5 m).
+
+Two things worth knowing, both measured rather than assumed:
+
+* **OpenVINO on the CPU is *slower* than PyTorch here** (~0.5x). The win is
+  entirely from the iGPU, so CPU OpenVINO is offered but never the default.
+* Exports use a **static batch of 1** — dynamic-shape exports were ~4x slower
+  on the iGPU (0.88 vs 0.20 s/frame). The detector classes therefore take a
+  `batch_size`, which `accel.batch_size_for()` sets to 1 for OpenVINO.
+
+The exported model's **task must be passed explicitly** when loading
+(`YOLO(dir, task="pose")`). Ultralytics cannot infer it from an OpenVINO
+directory and silently assumes `detect`, which turns the court key-point model
+into nonsense. `accel.model_task()` reads it from the original `.pt`.
+
+Accuracy caveat: the ball detector finds slightly fewer low-confidence boxes
+through OpenVINO (39 vs 44 over 8 frames). This was **identical at FP32 and
+FP16**, so it is a decode/NMS difference, not a precision loss.
 
 ---
 

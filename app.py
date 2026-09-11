@@ -25,7 +25,9 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from sports_core.registry import SPORT_KEYS, DEFAULT_SPORT, ALL_ROOTS, get_sport
+from sports_core.registry import (
+    SPORTS, SPORT_KEYS, DEFAULT_SPORT, ALL_ROOTS, get_sport,
+)
 from sports_core import isolation, theme
 
 SPORT_STATE_KEY = "active_sport"
@@ -60,8 +62,38 @@ theme.inject(sport)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR — brand + sport switcher (shared chrome, above each sport's controls)
+# SPORT SWITCHER (main window) + SIDEBAR BRANDING
 # ─────────────────────────────────────────────────────────────────────────────
+def switch_to(key):
+    """Change sport and restart the run so the new pipeline is imported."""
+    st.session_state[SPORT_STATE_KEY] = key
+    st.rerun()
+
+
+# ── main-window switcher: one button per sport, active one highlighted ───────
+st.markdown("<div class='sport-switch-label'>Choose a sport</div>",
+            unsafe_allow_html=True)
+
+switch_cols = st.columns(len(SPORTS) + 2)
+for col, option in zip(switch_cols, SPORTS):
+    active = option.key == sport.key
+    if col.button(
+        f"{option.icon}  {option.label}",
+        key=f"switch_{option.key}",
+        use_container_width=True,
+        type="primary" if active else "secondary",
+        help=f"Currently showing {option.label}" if active
+             else f"Switch to {option.label} analysis",
+    ):
+        switch_to(option.key)
+
+spacer_note = ", ".join(f"{s.icon} {s.label}" for s in SPORTS)
+st.markdown(
+    f"<div style='color:#484f58;font-size:0.7rem;margin:-0.3rem 0 1.2rem;'>"
+    f"Available: {spacer_note} — each keeps its own settings and results.</div>",
+    unsafe_allow_html=True,
+)
+
 with st.sidebar:
     st.markdown(f"""
     <div class="brand">
@@ -71,22 +103,17 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("<div class='sport-switch-label'>Sport</div>",
-                unsafe_allow_html=True)
-    st.radio(
-        "Sport",
-        options=list(SPORT_KEYS),
-        format_func=lambda k: f"{get_sport(k).icon}  {get_sport(k).label}",
-        key=SPORT_STATE_KEY,
-        horizontal=True,
-        label_visibility="collapsed",
+    # Current sport is shown here; switching happens with the buttons at the
+    # top of the page. Deliberately not a second widget bound to the same
+    # session-state key — one writer keeps the switch predictable.
+    st.markdown(
+        f"<div class='sport-switch-label'>Analysing</div>"
+        f"<div style='color:#e6edf3;font-weight:700;font-size:0.95rem;"
+        f"margin-bottom:0.2rem;'>{sport.icon} {sport.label}</div>"
+        f"<div style='color:#484f58;font-size:0.68rem;'>"
+        f"Switch sports at the top of the page.</div>",
+        unsafe_allow_html=True,
     )
-
-    # The radio may have just changed the selection — re-resolve so the rest of
-    # this run (and the pipeline we are about to import) uses the new sport.
-    if st.session_state[SPORT_STATE_KEY] != sport.key:
-        st.rerun()
-
     theme.rule()
 
 # Keep the URL in step with the switcher so the page can be bookmarked/shared.
