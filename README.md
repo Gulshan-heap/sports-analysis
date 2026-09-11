@@ -7,7 +7,12 @@ behind one Streamlit app with a sport switcher.
 streamlit run app.py
 ```
 
-![switch sports from the sidebar](https://img.shields.io/badge/sports-basketball%20%7C%20football-blue)
+| 🏀 Basketball | ⚽ Football |
+| --- | --- |
+| ![Basketball annotated frame with player tracks, speed and distance labels and a top-down tactical view](basketball_analysis/output_images/basketball_output.png) | ![Football annotated frame with team-coloured player tracks, speed and distance labels and possession markers](football_analysis/output_images/football_output.png) |
+| Player + ball tracking, team detection, court key-points, tactical view, speed & distance, passes and interceptions | Player + ball tracking, jersey-colour teams, possession, camera-movement compensation, speed & distance, heatmaps |
+
+More output below: [basketball](#basketball-output) · [football](#football-output)
 
 ---
 
@@ -399,8 +404,26 @@ detection, plus a frame explorer and CSV/JSON export.
 Model weights are fetched automatically from Google Drive on first run and
 cached; local `models/*.pt` files take priority if present.
 
-#### Basketball Output
-Example outputs from the basketball analysis pipeline:
+#### Basketball output
+
+**Annotated video.** Team-coloured ellipses under each player with their track
+ID, live speed (km/h) and distance (m); the ball-carrier marked by a triangle;
+detected court key-points in red; and the tactical top-down court inset, where
+every player is projected through the court homography. The strip along the
+bottom carries running ball-control, passes and interceptions per team.
+
+![Basketball annotated frame — player tracks, speed and distance labels, court key-points and the top-down tactical view](basketball_analysis/output_images/basketball_output.png)
+
+**Match Overview.** Ball control per team with the frames each is based on,
+total frames and unique players tracked, then the control bar with passes,
+interceptions and total actions — and ball control plotted across the clip.
+
+![Basketball Match Overview — ball-control KPI cards, passes and interceptions, and a ball-control-over-time area chart](basketball_analysis/output_images/basketball_match_overview.png)
+
+**Player Performance.** Per-player distance and top speed, colour-graded so
+outliers stand out, ranked by distance covered.
+
+![Basketball Player Performance — per-player distance and max-speed table with a distance-by-player bar chart](basketball_analysis/output_images/basketball_metrics.png)
 
 ### ⚽ Football
 Runs the pipeline as a **subprocess** (`main.py`), streaming its logs live into
@@ -412,7 +435,31 @@ per-player heatmaps, and per-frame CSV export.
 Point the **Detection** panel at your trained weights (defaults to
 `football_analysis/models/best.pt`).
 
-#### Football Output
-Example outputs from the football analysis pipeline:
+#### Football output
+
+**Annotated video.** Ellipses coloured by the KMeans jersey clustering — two
+outfield teams plus yellow for the referee — each with its track ID, speed
+(km/h) and distance (m). Triangles mark the ball and its current carrier. The
+optical-flow camera-movement estimate is printed top-left, the live throughput
+HUD top-right, and running possession bottom-right.
+
+![Football annotated frame — team-coloured player ellipses with speed and distance, ball-possession triangles, camera-movement readout and live possession](football_analysis/output_images/football_output.png)
+
+**Match Overview.** Possession split, players tracked and frames analysed,
+followed by the pipeline's own throughput — useful for sizing a longer run
+before you start it.
+
+![Football Match Overview — possession KPI cards and bar, plus pipeline throughput metrics](football_analysis/output_images/football_metrics.png)
+
+**Tracked data.** One row per player per frame — real-world x/y in metres,
+speed, cumulative distance, ball possession and which team is in control. The
+full table exports as CSV.
+
+Note the line above the table: that is the [speed sanity check](#speed-sanity-check)
+reporting *median 13.5 km/h, 90th percentile 37.4 km/h — physically plausible*.
+It is the one automatic guard on calibration quality, since the metres-per-pixel
+scale is the part the detector cannot measure for itself.
+
+![Football tracked data — per-frame CSV preview with the speed sanity check confirming plausible values](football_analysis/output_images/football_tracking_data.png)
 
 
