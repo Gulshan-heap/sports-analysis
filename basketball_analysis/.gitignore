@@ -1,0 +1,7 @@
+*.avi
+*.pt
+*models
+*.pkl
+*__pycache__
+*venv
+*.mp4

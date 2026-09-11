@@ -1,0 +1,36 @@
+# ── python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── model weights (fetched at runtime / too large for git) ────────────────────
+*.pt
+models/
+
+# ── pipeline artefacts ───────────────────────────────────────────────────────
+stubs/
+*.pkl
+runs/
+
+# ── media ────────────────────────────────────────────────────────────────────
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+input_video/
+input_videos/
+output_videos/
+app_uploads/
+
+# ── editors / os ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── streamlit ────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml

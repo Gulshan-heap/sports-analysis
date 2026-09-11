@@ -1,0 +1,32 @@
+# Sports Analysis — unified dependencies
+# Union of basketball_analysis/requirements.txt and
+# football_analysis/requirements.txt. Where both pinned a package, the
+# stricter (basketball) pin is kept — it satisfies football's minimums.
+
+# ── app ──────────────────────────────────────────────────────────────────────
+streamlit>=1.30
+altair>=5.0
+
+# ── core numerics ────────────────────────────────────────────────────────────
+numpy>=2.1.0,<2.4.0
+pandas==2.2.3
+scipy
+scikit-learn>=1.3.0
+Pillow==11.1.0
+
+# ── vision / tracking ────────────────────────────────────────────────────────
+opencv-python-headless==4.10.0.84
+ultralytics==8.3.67
+supervision==0.25.1
+torch==2.2.0
+transformers==4.46.3          # Fashion-CLIP team assignment (basketball)
+
+# ── video encoding ───────────────────────────────────────────────────────────
+av
+
+# ── plotting (football heatmaps) ─────────────────────────────────────────────
+matplotlib
+
+# ── model fetching ───────────────────────────────────────────────────────────
+gdown>=5.1.0
+roboflow==1.1.51

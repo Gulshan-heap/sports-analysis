@@ -1,0 +1,8 @@
+*__pycache__*
+*.pyc
+*input_video
+*output_videos
+*models
+*yolov8m.pt
+*runs
+app_uploads/

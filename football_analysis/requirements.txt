@@ -1,0 +1,10 @@
+streamlit>=1.30
+ultralytics>=8.0
+supervision>=0.18
+opencv-python-headless>=4.8
+numpy
+pandas
+scikit-learn
+matplotlib
+scipy
+av
