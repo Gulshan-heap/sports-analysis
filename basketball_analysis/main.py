@@ -38,8 +38,11 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Read Video
-    video_frames = read_video(args.input_video)
+    # Read Video.
+    # max_frames=0 keeps the CLI's original whole-video behaviour; the app
+    # streams instead (see basketball_analysis/ui.py), because a decoded 720p
+    # frame is 2.8 MB and the hosted container cannot hold a video's worth.
+    video_frames = read_video(args.input_video, max_frames=0)
     
     ## Initialize Tracker
     player_tracker = PlayerTracker(PLAYER_DETECTOR_PATH)

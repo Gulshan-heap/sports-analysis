@@ -1,0 +1,16 @@
+# Streamlit server settings for the deployed app.
+#
+# maxUploadSize is a memory setting, not a convenience setting: Streamlit
+# buffers an entire upload in the server process's RAM before any of our code
+# sees it. The default is 200 MB, which on a container with under 3 GB total
+# is a fifth of the budget spent before a single frame is decoded. 100 MB is
+# still several minutes of 1080p footage, and the pipelines cap analysis at
+# 180 seconds regardless.
+[server]
+maxUploadSize = 100
+# Nothing writes to the source tree at runtime, and the file watcher costs
+# memory and file handles proportional to the size of the repo.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false

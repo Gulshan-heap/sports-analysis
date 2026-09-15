@@ -28,7 +28,7 @@ for _p in (ROOT, REPO_ROOT):
 from sports_core.theme import (
     sec, kpi, kpi_grid, chip, spacer, feature_cards, html,
 )
-from sports_core import accel, weights
+from sports_core import accel, housekeeping, weights
 
 STATE_KEY = "football_results"
 
@@ -68,11 +68,24 @@ def ensure_model_ready(local_path, url):
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+# Uploads land in a directory inside the repo, so without pruning they
+# accumulate for the life of the container — a handful of match clips is
+# enough to fill a small host's disk.
+MAX_KEPT_UPLOADS = 3
+
+
 def save_upload(uploaded_file):
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     dst = os.path.join(UPLOAD_DIR, uploaded_file.name)
     with open(dst, "wb") as f:
         f.write(uploaded_file.getbuffer())
+    _prune_uploads(keep=dst)
     return dst
+
+
+def _prune_uploads(keep=None, limit=MAX_KEPT_UPLOADS):
+    """Keep only the most recent `limit` uploads, plus `keep`."""
+    housekeeping.prune(UPLOAD_DIR, keep=limit, protect=(keep,))
 
 
 def read_first_frame(video_path, max_h=720):
@@ -662,17 +675,17 @@ def _render_results(r):
     d1, d2, d3 = st.columns(3)
     if os.path.exists(r["raw_out"]):
         with open(r["raw_out"], "rb") as fh:
-            d1.download_button("🎬  Download raw video", fh.read(),
+            d1.download_button("🎬  Download raw video", fh,
                                file_name=os.path.basename(r["raw_out"]),
                                use_container_width=True, key="fb_dl_raw")
     if os.path.exists(r["csv_path"]):
         with open(r["csv_path"], "rb") as fh:
-            d2.download_button("📄  Download CSV", fh.read(),
+            d2.download_button("📄  Download CSV", fh,
                                file_name=os.path.basename(r["csv_path"]),
                                use_container_width=True, key="fb_dl_csv")
     if r["calib_path"] and os.path.exists(r["calib_path"]):
         with open(r["calib_path"], "rb") as fh:
-            d3.download_button("📐  Download calibration JSON", fh.read(),
+            d3.download_button("📐  Download calibration JSON", fh,
                                file_name=os.path.basename(r["calib_path"]),
                                use_container_width=True, key="fb_dl_calib")
 

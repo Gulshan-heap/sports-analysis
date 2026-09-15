@@ -136,35 +136,58 @@ class AutoTeamAssigner:
             out[team] = (int(r), int(g), int(b))
         return out
 
-    def get_player_teams_across_frames(self, video_frames, player_tracks,
-                                       read_from_stub=False, stub_path=None):
+    def samples_complete(self, player_tracks):
+        """True once every player seen so far has all the samples it needs.
+
+        Lets the caller stop decoding frames early: jersey colour is settled
+        long before the end of a long clip.
         """
-        Processes all video frames to auto-assign teams to players, with
-        optional caching. Same signature/return shape as
+        if not self.player_color_samples:
+            return False
+        return all(len(s) >= self.max_samples_per_player
+                   for s in self.player_color_samples.values())
+
+    def get_player_teams_across_frames(self, video_frames, player_tracks,
+                                       read_from_stub=False, stub_path=None,
+                                       expected_count=None):
+        """
+        Processes video frames to auto-assign teams to players, with optional
+        caching. Same signature/return shape as
         `TeamAssigner.get_player_teams_across_frames`.
 
         Args:
-            video_frames (list): List of video frames to process.
+            video_frames: Iterable of frames aligned with `player_tracks`.
+                A generator is fine and is the memory-cheap option — the
+                frames are consumed in order and never retained.
             player_tracks (list): List of player tracking information for
                 each frame.
             read_from_stub (bool): Whether to attempt reading cached results.
             stub_path (str): Path to the cache file.
+            expected_count (int, optional): Number of frames the iterable
+                yields; defaults to `len(video_frames)` when available.
 
         Returns:
             list: List of dictionaries mapping player IDs to team
                 assignments (1 or 2) for each frame.
         """
+        if expected_count is None:
+            expected_count = (len(video_frames)
+                              if hasattr(video_frames, "__len__") else None)
+
         cached = read_stub(read_from_stub, stub_path)
-        if cached is not None and len(cached) == len(video_frames):
+        if cached is not None and (expected_count is None
+                                   or len(cached) == expected_count):
             return cached
 
         # Pass 1 — collect jersey-color samples for every player in the video.
-        for frame_num, player_track in enumerate(player_tracks):
+        # Frames are zipped against the tracks rather than indexed, so the
+        # caller can hand in a lazy reader instead of the whole decoded video.
+        for frame_num, (frame, player_track) in enumerate(
+                zip(video_frames, player_tracks)):
             if frame_num % self.sample_every != 0:
                 continue
             for player_id, track in player_track.items():
-                self._collect_player_sample(
-                    video_frames[frame_num], track['bbox'], player_id)
+                self._collect_player_sample(frame, track['bbox'], player_id)
 
         # Discover the two team colors and lock in each player's team.
         self._finalize_team_colors()

@@ -67,7 +67,13 @@ class TacticalViewConverter:
         keypoints_list = deepcopy(keypoints_list)
 
         for frame_idx, frame_keypoints in enumerate(keypoints_list):
-            frame_keypoints = frame_keypoints.xy.tolist()[0]
+            # A frame where the detector found nothing comes back with an
+            # empty xy array. Indexing [0] on that raised IndexError and took
+            # down the whole run — one undetected frame is not a fatal error.
+            detected = frame_keypoints.xy.tolist()
+            if not detected:
+                continue
+            frame_keypoints = detected[0]
             
             # Get indices of detected keypoints (not (0, 0))
             detected_indices = [i for i, kp in enumerate(frame_keypoints) if kp[0] >0 and kp[1]>0]
@@ -133,7 +139,8 @@ class TacticalViewConverter:
             # Initialize empty dictionary for this frame
             tactical_positions = {}
 
-            frame_keypoints = frame_keypoints.xy.tolist()[0]
+            detected = frame_keypoints.xy.tolist()
+            frame_keypoints = detected[0] if detected else []
 
             # Skip frames with insufficient keypoints
             if frame_keypoints is None or len(frame_keypoints) == 0:

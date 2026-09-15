@@ -14,6 +14,23 @@ class BallTracksDrawer:
         """
         self.ball_pointer_color = (0, 255, 0)
 
+    def draw_frame(self, frame, ball_dict):
+        """
+        Draw one frame's ball pointer, in place.
+
+        Args:
+            frame (numpy.ndarray): The frame to annotate. Modified in place.
+            ball_dict (dict): Ball detections for this frame.
+
+        Returns:
+            numpy.ndarray: The same frame, annotated.
+        """
+        for _, ball in ball_dict.items():
+            if ball.get("bbox") is None:
+                continue
+            frame = draw_traingle(frame, ball["bbox"], self.ball_pointer_color)
+        return frame
+
     def draw(self, video_frames, tracks):
         """
         Draws ball pointers on each video frame based on provided tracking information.
@@ -28,15 +45,7 @@ class BallTracksDrawer:
         """
         output_video_frames = []
         for frame_num, frame in enumerate(video_frames):
-            frame = frame.copy()
-            ball_dict = tracks[frame_num]
+            output_video_frames.append(
+                self.draw_frame(frame.copy(), tracks[frame_num]))
 
-            # Draw ball 
-            for _, ball in ball_dict.items():
-                if ball["bbox"] is None:
-                    continue
-                frame = draw_traingle(frame, ball["bbox"],self.ball_pointer_color)
-
-            output_video_frames.append(frame)
-            
         return output_video_frames

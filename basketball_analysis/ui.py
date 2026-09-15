@@ -10,6 +10,7 @@ All filesystem paths are anchored to ROOT rather than the process working
 directory, because the router runs from the repository root.
 """
 
+import gc
 import hashlib
 import os
 import shutil
@@ -33,13 +34,26 @@ for _p in (ROOT, REPO_ROOT):
 from sports_core.theme import (
     sec, kpi, kpi_grid, chip, spacer, feature_cards, html,
 )
-from sports_core import accel
+from sports_core import accel, checkpoints, housekeeping, memory
 
 STATE_KEY = "basketball_results"
 
 DEFAULT_STUB_DIR = os.path.join(ROOT, "stubs")
 DEFAULT_OUTPUT_DIR = os.path.join(ROOT, "output_videos")
 COURT_IMAGE_PATH = os.path.join(ROOT, "images", "basketball_court.png")
+
+# ── input ceilings ───────────────────────────────────────────────────────────
+# These are not performance knobs, they are survival knobs. A decoded 1080p
+# frame is 6.2 MB and a 4K frame is 25 MB; the hosted container has under 3 GB
+# in total and ~750 MB of that is gone before a frame is read. Downscaling to
+# a 1280-pixel long side and refusing to analyse more than a couple of minutes
+# keeps both the working set and the intermediate AVI on disk bounded, whatever
+# anyone uploads. See sports_core/memory.py.
+MAX_LONG_SIDE_DEFAULT = 1280
+MAX_ANALYSIS_SECONDS = 180
+# How many previous runs' cached detections and rendered videos to keep.
+MAX_KEPT_RUNS = 3
+UPLOAD_TMP_KEY = "basketball_upload_tmp"
 
 MODEL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "basketball_analysis_models")
 DRIVE_CACHE_DIR = os.path.join(MODEL_CACHE_DIR, "drive")
@@ -57,9 +71,48 @@ DEFAULT_DRIVE_FOLDER_URL = (
 # ─────────────────────────────────────────────────────────────────────────────
 # PERFORMANCE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def video_fingerprint(data):
-    """Short content hash of an uploaded video, used to key the stub cache."""
-    return hashlib.sha1(data).hexdigest()[:10]
+def _stage_upload(uploaded, chunk_size=4 << 20):
+    """Write an upload to a temp file, hashing as it goes, and return
+    (path, fingerprint).
+
+    Two things this fixes over the old `uploaded.getvalue()` + fresh
+    NamedTemporaryFile per rerun:
+
+    * the whole file is no longer materialised a second time as one bytes
+      object purely to be hashed and written;
+    * the temp file for a previous upload is deleted. Streamlit reruns the
+      script on every widget interaction, and the old code leaked one copy of
+      the video into the temp directory each time — enough to fill a small
+      container's disk in a single session.
+    """
+    previous = st.session_state.get(UPLOAD_TMP_KEY)
+
+    digest = hashlib.sha1()
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    try:
+        uploaded.seek(0)
+        while True:
+            chunk = uploaded.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+            handle.write(chunk)
+    finally:
+        handle.close()
+        uploaded.seek(0)
+
+    path = handle.name
+    fingerprint = digest.hexdigest()[:10]
+
+    if previous and previous.get("path") != path:
+        try:
+            os.remove(previous["path"])
+        except OSError:
+            pass                      # already gone, or held open — harmless
+
+    st.session_state[UPLOAD_TMP_KEY] = {"path": path,
+                                        "fingerprint": fingerprint}
+    return path, fingerprint
 
 
 def expand_strided(sampled, stride, total):
@@ -230,22 +283,46 @@ def ensure_models_ready():
     Local `models/*.pt` files win if they are already present.
     """
     local = sorted(Path(os.path.join(ROOT, "models")).glob("*.pt"))
+    mapping = None
     if len(local) >= 3:
-        mapping = match_model_files(local)
-        if all(mapping.values()):
-            return tuple(str(mapping[r]) for r in ("player", "ball", "court"))
+        candidate = match_model_files(local)
+        if all(candidate.values()):
+            mapping = candidate
+
+    if mapping is None:
+        try:
+            pt_files = download_models_from_drive(DEFAULT_DRIVE_FOLDER_URL)
+        except Exception:
+            return None, None, None
+
+        if not pt_files:
+            return None, None, None
+
+        mapping = match_model_files(pt_files)
+
+    return _slim_models(mapping)
+
+
+def _slim_models(mapping):
+    """Replace each checkpoint with an inference-only copy where that helps.
+
+    The shipped court detector is a 418 MB training checkpoint: optimizer
+    state, EMA weights and all. Loading it costs ~590 MB of resident memory
+    for tensors inference never reads. Stripping happens once per file into a
+    temp cache; see sports_core/checkpoints.py for the measurements.
+    """
+    paths = {role: str(mapping[role]) if mapping.get(role) else None
+             for role in ("player", "ball", "court")}
+    if not all(paths.values()):
+        return tuple(paths[r] for r in ("player", "ball", "court"))
 
     try:
-        pt_files = download_models_from_drive(DEFAULT_DRIVE_FOLDER_URL)
+        slim = checkpoints.strip_all(paths)
     except Exception:
-        return None, None, None
+        # A failed strip must never cost us the models themselves.
+        slim = paths
 
-    if not pt_files:
-        return None, None, None
-
-    mapping = match_model_files(pt_files)
-    return tuple(str(mapping[r]) if mapping[r] else None
-                 for r in ("player", "ball", "court"))
+    return tuple(slim[r] for r in ("player", "ball", "court"))
 
 
 def check_models(player_model, ball_model, court_model):
@@ -261,8 +338,42 @@ def check_models(player_model, ball_model, court_model):
 # ─────────────────────────────────────────────────────────────────────────────
 # VIDEO + STATS
 # ─────────────────────────────────────────────────────────────────────────────
+def transcode_h264(src_path, output_path, fps=24):
+    """Re-encode `src_path` to a browser-playable H.264 mp4 in place of it.
+
+    Falls back to simply moving the file when ffmpeg is unavailable — the
+    result still downloads, it just may not preview in the browser.
+    """
+    if not shutil.which("ffmpeg"):
+        os.replace(src_path, output_path)
+        return False
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src_path,
+             "-vcodec", "libx264", "-preset", "fast", "-crf", "23",
+             # yuv420p needs even dimensions; an odd-sized source would
+             # otherwise fail the whole encode.
+             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+             output_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        os.remove(src_path)
+        return True
+    except subprocess.CalledProcessError:
+        os.replace(src_path, output_path)
+        return False
+
+
 def frames_to_video(frames, output_path, fps=24):
-    """Write frames → temp AVI → re-encode to H.264 mp4 via ffmpeg."""
+    """Write an in-memory frame list → H.264 mp4.
+
+    Only the legacy CLI path uses this. The Streamlit pipeline streams into
+    `open_video_writer` one frame at a time instead — see `_render_and_encode`.
+    """
+    from utils import open_video_writer
+
+    frames = list(frames)
     if not frames:
         return
     h, w = frames[0].shape[:2]
@@ -271,25 +382,13 @@ def frames_to_video(frames, output_path, fps=24):
         os.makedirs(out_dir, exist_ok=True)
 
     tmp_avi = output_path.replace(".mp4", "_tmp.avi")
-    writer = cv2.VideoWriter(tmp_avi, cv2.VideoWriter_fourcc(*"XVID"), fps, (w, h))
-    for f in frames:
-        writer.write(f)
-    writer.release()
-
-    if shutil.which("ffmpeg"):
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", tmp_avi,
-                 "-vcodec", "libx264", "-preset", "fast", "-crf", "23",
-                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
-                 output_path],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            os.remove(tmp_avi)
-            return
-        except subprocess.CalledProcessError:
-            pass
-    os.replace(tmp_avi, output_path)
+    writer = open_video_writer(tmp_avi, w, h, fps)
+    try:
+        for f in frames:
+            writer.write(f)
+    finally:
+        writer.release()
+    transcode_h264(tmp_avi, output_path, fps)
 
 
 def compute_stats(ball_aquisition, player_assignment, passes, interceptions,
@@ -354,8 +453,13 @@ def _sidebar():
         device_label = "GPU (CUDA)" if device == "cuda" else "CPU"
         device_color = "#3fb950" if device == "cuda" else "#8b949e"
         chip(f"{device_icon} {device_label}", device_name, device_color)
+        chip("🧠 Memory", memory.describe(), "#8b949e")
 
-        with st.spinner("Loading model weights…"):
+        # First boot also strips the training baggage out of the checkpoints,
+        # which takes ~20 s once and is then cached on disk — say so, rather
+        # than showing a bare spinner for twenty seconds.
+        with st.spinner("Loading model weights (first run also slims them, "
+                        "~20 s — cached afterwards)…"):
             player_model, ball_model, court_model = ensure_models_ready()
 
         if player_model and ball_model and court_model:
@@ -418,9 +522,23 @@ def _sidebar():
                            "every frame is the whole cost. These controls trade "
                            "a little accuracy for a lot of speed.")
             max_seconds = st.number_input(
-                "Analyse first N seconds (0 = whole video)",
-                min_value=0, value=0, step=5, key="bb_max_secs",
-                help="The quickest way to get a result out of a long clip.")
+                f"Analyse first N seconds (0 = whole video, max "
+                f"{MAX_ANALYSIS_SECONDS})",
+                min_value=0, max_value=MAX_ANALYSIS_SECONDS,
+                value=0, step=5, key="bb_max_secs",
+                help="The quickest way to get a result out of a long clip. "
+                     f"Anything past {MAX_ANALYSIS_SECONDS}s is trimmed "
+                     "regardless — see the note under Processing resolution.")
+            max_long_side = st.select_slider(
+                "Processing resolution (long side, px)",
+                options=[640, 854, 1280, 1920],
+                value=MAX_LONG_SIDE_DEFAULT, key="bb_max_long",
+                help="Frames are downscaled to this before anything touches "
+                     "them, and the annotated video comes out at this size. "
+                     "It bounds decode cost, draw cost, the intermediate file "
+                     "on disk and the memory a frame occupies — a 4K frame is "
+                     "25 MB, a 1280-wide one is 2.8 MB. Videos already smaller "
+                     "than this are left alone.")
             detect_stride = st.slider(
                 "Detect every Nth frame", 1, 10, 1, key="bb_stride",
                 help="Players and the ball are detected on every Nth frame; "
@@ -452,6 +570,15 @@ def _sidebar():
             stub_dir = st.text_input("Cache directory", value=DEFAULT_STUB_DIR,
                                      key="bb_stub_dir")
             output_fps = st.slider("Output FPS", 12, 60, 24, key="bb_fps")
+            batch_size = st.slider(
+                "Detection batch size", 1, 32,
+                4 if memory.is_constrained() else 8, key="bb_batch",
+                help="Frames sent to YOLO at once — the knob that sets peak "
+                     "memory now that nothing else buffers. Measured on CPU "
+                     "with these models: batch 1 adds 188 MB and runs at "
+                     "3.4 fps, batch 4 adds 263 MB at 4.1 fps, batch 8 adds "
+                     "330 MB at 4.3 fps, batch 20 adds 574 MB and is *slower* "
+                     "at 3.2 fps. Past about 8 it is all cost and no gain.")
 
         with st.expander("🎨 Visualisation Layers", expanded=False):
             layers = {
@@ -489,15 +616,43 @@ def _sidebar():
         "keypoint_every": int(keypoint_every),
         "imgsz": int(imgsz),
         "backend": backend,
+        "max_long_side": int(max_long_side),
+        "batch_size": int(batch_size),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
+def _at(seq, index, default=None):
+    """`seq[index]` when it exists, else `default`.
+
+    Container frame counts are advisory: some files report more frames than
+    they decode. Every per-frame list is therefore read defensively so a
+    ragged tail cannot take down a run that is otherwise finished.
+    """
+    if seq is None or index >= len(seq):
+        return default
+    return seq[index]
+
+
 def _run_pipeline(video_path, cfg):
-    """Execute the full basketball pipeline, returning the results dict."""
-    from utils import read_video
+    """Execute the full basketball pipeline, returning the results dict.
+
+    The pipeline makes several lazy passes over the file rather than decoding
+    it into a list once. Decoding is cheap next to YOLO inference (sub-second
+    per pass against minutes of detection), and it is the difference between a
+    peak of a few megabytes of pixels and a peak of several gigabytes:
+
+      1. players      — every `stride`-th frame
+      2. ball         — every `stride`-th frame
+      3. court        — every `kp_every`-th frame
+      4. team colours — every frame
+      5. render + encode — every frame, straight into the video writer
+
+    At no point is more than one batch of frames alive.
+    """
+    from utils import frame_reader, get_video_info, scaled_size
     from trackers import PlayerTracker, BallTracker
     # TeamAssigner is imported lazily inside the manual branch — it pulls in
     # transformers + Fashion-CLIP, which the automatic path never needs.
@@ -520,40 +675,77 @@ def _run_pipeline(video_path, cfg):
     kp_every = max(1, cfg["keypoint_every"])
     imgsz = cfg["imgsz"]
 
+    # ── what, exactly, are we analysing? ─────────────────────────────────────
+    src_w, src_h, src_fps, src_count = get_video_info(video_path)
+    scale = memory.fit_scale(src_w, src_h, cfg["max_long_side"])
+    proc_w, proc_h = scaled_size(src_w, src_h, scale)
+
+    total_frames = src_count or 0
+    if cfg["max_seconds"]:
+        capped = int(cfg["max_seconds"] * src_fps)
+        total_frames = min(total_frames, capped) if total_frames else capped
+    if not total_frames:
+        # Unreported frame count: fall back to the duration ceiling so the
+        # lazy readers still terminate.
+        total_frames = int(MAX_ANALYSIS_SECONDS * src_fps)
+    total_frames = min(total_frames, int(MAX_ANALYSIS_SECONDS * src_fps))
+
+    def frames(step=1, count=None):
+        """A fresh lazy reader over the analysed slice, at processing scale."""
+        return (frame for _, frame in frame_reader(
+            video_path, max_frames=count, scale=scale, stride=step))
+
+    n_det = -(-total_frames // stride)       # ceil
+    n_kp = -(-total_frames // kp_every)
+
     # Cache detections per (video content, settings) so re-running the same clip
     # is instant, and so two different videos can never share a cache entry.
     stub_dir = os.path.join(
         cfg["stub_dir"],
-        f"{cfg['fingerprint']}_s{stride}k{kp_every}i{imgsz}_{cfg['backend']}")
+        f"{cfg['fingerprint']}_s{stride}k{kp_every}i{imgsz}"
+        f"w{proc_w}_{cfg['backend']}")
     os.makedirs(stub_dir, exist_ok=True)
+
+    # Every distinct (video, settings) combination gets its own cache
+    # directory, so without pruning the disk fills with pickles nobody will
+    # look at again. Same for rendered outputs.
+    housekeeping.prune(cfg["stub_dir"], keep=MAX_KEPT_RUNS, protect=(stub_dir,))
+    housekeeping.prune(DEFAULT_OUTPUT_DIR, keep=MAX_KEPT_RUNS,
+                       suffixes=(".mp4", ".avi"))
 
     prog = st.progress(0)
     status = st.empty()
     timings = {}
 
     def upd(pct, msg):
-        prog.progress(pct)
+        prog.progress(min(100, max(0, int(pct))))
         status.markdown(
             f"<div style='color:#8b949e;font-size:0.85rem;margin-top:0.3rem;'>{msg}</div>",
             unsafe_allow_html=True)
 
     def stage(name):
-        """Context-free stopwatch: stage('x') ... records elapsed under 'x'."""
+        """Context-free stopwatch: stage('x') ... done('x') records elapsed."""
         timings[name] = time.time()
 
     def done(name):
         timings[name] = round(time.time() - timings[name], 1)
 
+    def detect_progress(label, base, span, expected, step):
+        """Live per-batch progress for a detection pass.
+
+        Detection is the long pole; without this the bar sat frozen for
+        minutes and the run looked hung.
+        """
+        def report(count, _expected):
+            frac = (count / float(expected)) if expected else 0.0
+            upd(base + span * frac,
+                f"{label} — frame {min(count * step, total_frames)} "
+                f"of {total_frames}")
+        return report
+
     t0 = time.time()
 
-    upd(5, "📽️ Reading video frames…")
-    stage("read")
-    video_frames = read_video(video_path)
-    if cfg["max_seconds"]:
-        video_frames = video_frames[:int(cfg["max_seconds"] * cfg["output_fps"])]
-    total_frames = len(video_frames)
-    done("read")
-
+    # ── 1. detectors ─────────────────────────────────────────────────────────
     # Resolve the three checkpoints for the chosen backend. OpenVINO converts
     # on first use (slow once, then cached); if that fails for any reason we
     # fall back to PyTorch rather than failing the run.
@@ -565,8 +757,8 @@ def _run_pipeline(video_path, cfg):
                              ("ball", cfg["ball_model"]),
                              ("court", cfg["court_model"])):
                 if not accel.is_exported(pt, imgsz):
-                    upd(10, f"⚙️ Converting {role} model to OpenVINO "
-                            f"(one-off, ~30 s)…")
+                    upd(6, f"⚙️ Converting {role} model to OpenVINO "
+                           f"(one-off, ~30 s)…")
                 resolved[role] = accel.resolve_model(pt, imgsz, backend)
         except Exception as exc:
             st.warning(f"OpenVINO conversion failed ({exc}). "
@@ -582,87 +774,130 @@ def _run_pipeline(video_path, cfg):
                     "court": (cfg["court_model"], None)}
 
     pred_device = accel.predict_device(backend)
-    batch = accel.batch_size_for(backend)
+    batch = accel.batch_size_for(backend, default=cfg["batch_size"])
 
-    upd(10, f"🔍 Initialising detectors — {accel.label_for(backend)}…")
-    player_tracker = PlayerTracker(resolved["player"][0], device=pred_device,
-                                   imgsz=imgsz, task=resolved["player"][1],
-                                   batch_size=batch)
-    ball_tracker = BallTracker(resolved["ball"][0], device=pred_device,
-                               imgsz=imgsz, task=resolved["ball"][1],
-                               batch_size=batch)
-    court_kp_det = CourtKeypointDetector(resolved["court"][0], device=pred_device,
-                                         imgsz=imgsz, task=resolved["court"][1],
-                                         batch_size=batch)
+    # ── 2. detection passes ──────────────────────────────────────────────────
+    # One detector is constructed, used and released at a time. Holding all
+    # three cost 1.4 GB of resident memory; sequentially, with the stripped
+    # checkpoints, the same three cost ~460 MB. See sports_core/checkpoints.py.
+    # A detector whose stub is already cached is never constructed at all.
+    def stub(name):
+        return os.path.join(stub_dir, name)
 
-    # Detect on a subsampled frame list, then hold each result until the next
-    # sample. The court detector gets its own, much coarser interval.
-    det_frames = video_frames[::stride]
-    kp_frames = video_frames[::kp_every]
+    def cached(path, expected):
+        """The cached result for this pass, or None if it has to be computed."""
+        if not use_stubs:
+            return None
+        from utils import read_stub
+        result = read_stub(True, path)
+        if result is not None and len(result) == expected:
+            return result
+        return None
 
-    upd(15, f"🏃 Tracking players ({len(det_frames)} of {total_frames} frames)…")
+    def detection_pass(stub_name, expected, step, make_detector, method,
+                       label, base, span):
+        """Run one detection pass over every `step`-th frame.
+
+        The detector is constructed only on a cache miss, and released as soon
+        as the pass is done, so its weights are never resident alongside
+        another detector's.
+        """
+        path = stub(stub_name)
+        result = cached(path, expected)
+        if result is not None:
+            return result
+
+        detector = make_detector()
+        try:
+            return getattr(detector, method)(
+                frames(step, expected), read_from_stub=False, stub_path=path,
+                expected_count=expected,
+                on_progress=detect_progress(label, base, span, expected, step))
+        finally:
+            del detector
+            gc.collect()
+
+    upd(10, f"🏃 Tracking players ({n_det} of {total_frames} frames)…")
     stage("players")
     player_tracks = interpolate_tracks(
-        player_tracker.get_object_tracks(
-            det_frames, read_from_stub=use_stubs,
-            stub_path=os.path.join(stub_dir, "player_track_stubs.pkl")),
+        detection_pass(
+            "player_track_stubs.pkl", n_det, stride,
+            lambda: PlayerTracker(resolved["player"][0], device=pred_device,
+                                  imgsz=imgsz, task=resolved["player"][1],
+                                  batch_size=batch),
+            "get_object_tracks", "🏃 Tracking players", 10, 18),
         stride, total_frames)
     done("players")
 
-    upd(30, f"🏀 Tracking ball ({len(det_frames)} of {total_frames} frames)…")
+    upd(28, f"🏀 Tracking ball ({n_det} of {total_frames} frames)…")
     stage("ball")
     ball_tracks = scatter_strided(
-        ball_tracker.get_object_tracks(
-            det_frames, read_from_stub=use_stubs,
-            stub_path=os.path.join(stub_dir, "ball_track_stubs.pkl")),
+        detection_pass(
+            "ball_track_stubs.pkl", n_det, stride,
+            lambda: BallTracker(resolved["ball"][0], device=pred_device,
+                                imgsz=imgsz, task=resolved["ball"][1],
+                                batch_size=batch),
+            "get_object_tracks", "🏀 Tracking ball", 28, 10),
         stride, total_frames)
     done("ball")
 
-    upd(38, f"🔑 Detecting court key-points ({len(kp_frames)} of {total_frames} frames)…")
+    upd(38, "🧹 Cleaning ball track…")
+    # Pure post-processing on the track list — static, so no detector (and no
+    # 400 MB of weights) has to be alive for it.
+    ball_tracks = BallTracker.remove_wrong_detections(ball_tracks)
+    ball_tracks = BallTracker.interpolate_ball_positions(ball_tracks)
+
+    upd(40, f"🔑 Detecting court key-points ({n_kp} of {total_frames} frames)…")
     stage("court")
     court_kp = expand_strided(
-        court_kp_det.get_court_keypoints(
-            kp_frames, read_from_stub=use_stubs,
-            stub_path=os.path.join(stub_dir, "court_key_points_stub.pkl")),
+        detection_pass(
+            "court_key_points_stub.pkl", n_kp, kp_every,
+            lambda: CourtKeypointDetector(resolved["court"][0],
+                                          device=pred_device, imgsz=imgsz,
+                                          task=resolved["court"][1],
+                                          batch_size=batch),
+            "get_court_keypoints", "🔑 Court key-points", 40, 8),
         kp_every, total_frames)
     done("court")
+    gc.collect()
 
-    upd(42, "🧹 Cleaning ball track…")
-    ball_tracks = ball_tracker.remove_wrong_detections(ball_tracks)
-    ball_tracks = ball_tracker.interpolate_ball_positions(ball_tracks)
-
+    # ── 3. team assignment ───────────────────────────────────────────────────
     team_colors = None
     stage("teams")
     if cfg["team_mode"].startswith("Automatic"):
-        upd(48, "👕 Discovering team colors automatically…")
+        upd(50, "👕 Discovering team colors automatically…")
         team_assigner = AutoTeamAssigner()
         player_assignment = team_assigner.get_player_teams_across_frames(
-            video_frames, player_tracks, read_from_stub=use_stubs,
-            stub_path=os.path.join(stub_dir, "auto_player_assignment_stub.pkl"))
+            frames(1, total_frames), player_tracks, read_from_stub=use_stubs,
+            stub_path=os.path.join(stub_dir, "auto_player_assignment_stub.pkl"),
+            expected_count=total_frames)
         team_colors = team_assigner.get_team_color_preview()
     else:
-        upd(48, "👕 Assigning teams from jersey descriptions…")
+        upd(50, "👕 Assigning teams from jersey descriptions…")
         from team_assigner import TeamAssigner
         team_assigner = TeamAssigner(
             team_1_class_name=cfg["team1_color"],
             team_2_class_name=cfg["team2_color"],
             device=device)
         player_assignment = team_assigner.get_player_teams_across_frames(
-            video_frames, player_tracks, read_from_stub=use_stubs,
-            stub_path=os.path.join(stub_dir, "player_assignment_stub.pkl"))
-
+            frames(1, total_frames), player_tracks, read_from_stub=use_stubs,
+            stub_path=os.path.join(stub_dir, "player_assignment_stub.pkl"),
+            expected_count=total_frames)
     done("teams")
+    del team_assigner
+    gc.collect()
 
-    upd(55, "🤝 Detecting ball possession…")
+    # ── 4. derived signals (all cheap, all per-frame dicts) ──────────────────
+    upd(58, "🤝 Detecting ball possession…")
     ball_aquisition = BallAquisitionDetector().detect_ball_possession(
         player_tracks, ball_tracks)
 
-    upd(60, "📊 Detecting passes & interceptions…")
+    upd(62, "📊 Detecting passes & interceptions…")
     pi_det = PassAndInterceptionDetector()
     passes = pi_det.detect_passes(ball_aquisition, player_assignment)
     interceptions = pi_det.detect_interceptions(ball_aquisition, player_assignment)
 
-    upd(65, "🗺️ Computing tactical view…")
+    upd(66, "🗺️ Computing tactical view…")
     tactical_conv = TacticalViewConverter(court_image_path=COURT_IMAGE_PATH)
     court_kp = tactical_conv.validate_keypoints(court_kp)
     tactical_pos = tactical_conv.transform_players_to_tactical_view(
@@ -675,60 +910,54 @@ def _run_pipeline(video_path, cfg):
     dist_per_frame = speed_calc.calculate_distance(tactical_pos)
     speed_per_frame = speed_calc.calculate_speed(dist_per_frame)
 
-    upd(78, "🎨 Drawing visualisations…")
+    # ── 5. render + encode, one frame at a time ──────────────────────────────
     stage("draw")
-    out_frames = video_frames.copy()
-    if layers["players"]:
-        out_frames = PlayerTracksDrawer().draw(
-            out_frames, player_tracks, player_assignment, ball_aquisition)
-    if layers["ball"]:
-        out_frames = BallTracksDrawer().draw(out_frames, ball_tracks)
-    if layers["keypoints"]:
-        out_frames = CourtKeypointDrawer().draw(out_frames, court_kp)
-    if layers["frame_num"]:
-        out_frames = FrameNumberDrawer().draw(out_frames)
-    if layers["ball_ctrl"]:
-        out_frames = TeamBallControlDrawer().draw(
-            out_frames, player_assignment, ball_aquisition)
-    if layers["passes"]:
-        out_frames = PassInterceptionDrawer().draw(out_frames, passes, interceptions)
-    if layers["speed"]:
-        out_frames = SpeedAndDistanceDrawer().draw(
-            out_frames, player_tracks, dist_per_frame, speed_per_frame)
-    if layers["tactical"]:
-        out_frames = TacticalViewDrawer().draw(
-            out_frames, tactical_conv.court_image_path,
-            tactical_conv.width, tactical_conv.height,
-            tactical_conv.key_points, tactical_pos,
-            player_assignment, ball_aquisition)
-
-    done("draw")
-
-    upd(90, "💾 Encoding video (H.264)…")
-    stage("encode")
     out_path = os.path.join(DEFAULT_OUTPUT_DIR,
                             f"output_{cfg['fingerprint']}.mp4")
-    frames_to_video(out_frames, out_path, fps=cfg["output_fps"])
-    done("encode")
+    written = _render_and_encode(
+        out_path, cfg, layers,
+        reader=frames(1, total_frames),
+        total_frames=total_frames,
+        size=(proc_w, proc_h),
+        player_tracks=player_tracks,
+        ball_tracks=ball_tracks,
+        court_kp=court_kp,
+        player_assignment=player_assignment,
+        ball_aquisition=ball_aquisition,
+        passes=passes,
+        interceptions=interceptions,
+        dist_per_frame=dist_per_frame,
+        speed_per_frame=speed_per_frame,
+        tactical_conv=tactical_conv,
+        tactical_pos=tactical_pos,
+        drawers=(PlayerTracksDrawer, BallTracksDrawer, CourtKeypointDrawer,
+                 FrameNumberDrawer, TeamBallControlDrawer,
+                 PassInterceptionDrawer, SpeedAndDistanceDrawer,
+                 TacticalViewDrawer),
+        on_progress=lambda i: upd(74 + 22 * (i / float(total_frames or 1)),
+                                  f"🎨 Rendering frame {i} of {total_frames}…"),
+    )
+    done("draw")
+
+    # `written` is authoritative: the container's frame count is only a hint,
+    # so the stats below describe what actually made it into the video.
+    total_frames = written or total_frames
 
     prog.progress(100)
     status.empty()
+    gc.collect()
 
     elapsed = time.time() - t0
 
-    # Deliberately NOT keeping `out_frames` — see read_frame_at(). Holding the
-    # annotated frames would cost ~830 MB for a 10-second 720p clip.
-    del out_frames
-
     return {
         "out_video_path": out_path,
-        "ball_aquisition": ball_aquisition,
-        "player_assignment": player_assignment,
-        "passes": passes,
-        "interceptions": interceptions,
-        "player_speed_per_frame": speed_per_frame,
-        "player_distances_per_frame": dist_per_frame,
-        "player_tracks": player_tracks,
+        "ball_aquisition": ball_aquisition[:total_frames],
+        "player_assignment": player_assignment[:total_frames],
+        "passes": passes[:total_frames],
+        "interceptions": interceptions[:total_frames],
+        "player_speed_per_frame": speed_per_frame[:total_frames],
+        "player_distances_per_frame": dist_per_frame[:total_frames],
+        "player_tracks": player_tracks[:total_frames],
         "total_frames": total_frames,
         "team_colors": team_colors,
         "elapsed": elapsed,
@@ -739,10 +968,109 @@ def _run_pipeline(video_path, cfg):
             "imgsz": imgsz,
             "backend": accel.label_for(backend),
             "device": cfg["device_name"],
-            "frames_detected": len(det_frames),
-            "keypoint_frames": len(kp_frames),
+            "frames_detected": n_det,
+            "keypoint_frames": n_kp,
+            "source_size": f"{src_w}x{src_h}",
+            "processed_size": f"{proc_w}x{proc_h}",
         },
     }
+
+
+def _render_and_encode(out_path, cfg, layers, reader, total_frames, size,
+                       player_tracks, ball_tracks, court_kp, player_assignment,
+                       ball_aquisition, passes, interceptions, dist_per_frame,
+                       speed_per_frame, tactical_conv, tactical_pos, drawers,
+                       on_progress=None):
+    """Draw every enabled layer onto each frame and write it straight out.
+
+    This replaces the old chain of eight whole-video list transforms. Each of
+    those allocated a fresh copy of every frame, so with the original list and
+    the one under construction the peak was three full videos of pixels —
+    ~2 GB for an eight-second 720p clip, on a container with under 3 GB total.
+    Here exactly one frame is alive at a time and it goes to the encoder as
+    soon as it is drawn.
+
+    Returns the number of frames actually written.
+    """
+    from utils import open_video_writer
+
+    (PlayerTracksDrawer, BallTracksDrawer, CourtKeypointDrawer,
+     FrameNumberDrawer, TeamBallControlDrawer, PassInterceptionDrawer,
+     SpeedAndDistanceDrawer, TacticalViewDrawer) = drawers
+
+    proc_w, proc_h = size
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp_avi = out_path.replace(".mp4", "_tmp.avi")
+
+    players_d = PlayerTracksDrawer() if layers["players"] else None
+    ball_d = BallTracksDrawer() if layers["ball"] else None
+    court_d = CourtKeypointDrawer() if layers["keypoints"] else None
+    number_d = FrameNumberDrawer() if layers["frame_num"] else None
+    control_d = TeamBallControlDrawer() if layers["ball_ctrl"] else None
+    pass_d = PassInterceptionDrawer() if layers["passes"] else None
+    speed_d = SpeedAndDistanceDrawer() if layers["speed"] else None
+    tactical_d = TacticalViewDrawer() if layers["tactical"] else None
+
+    # Computed once instead of per frame: the possession array and the court
+    # image were both rebuilt on every frame the old drawers touched.
+    team_ball_control = (control_d.get_team_ball_control(
+        player_assignment, ball_aquisition) if control_d else None)
+    court_image = (tactical_d.court_image(
+        tactical_conv.court_image_path, tactical_conv.width,
+        tactical_conv.height) if tactical_d else None)
+
+    writer = open_video_writer(tmp_avi, proc_w, proc_h, cfg["output_fps"])
+    written = 0
+    try:
+        for index, frame in enumerate(reader):
+            if index >= total_frames:
+                break
+
+            if players_d:
+                players_d.draw_frame(
+                    frame,
+                    _at(player_tracks, index, {}),
+                    _at(player_assignment, index, {}),
+                    _at(ball_aquisition, index, -1))
+            if ball_d:
+                ball_d.draw_frame(frame, _at(ball_tracks, index, {}))
+            if court_d:
+                keypoints = _at(court_kp, index)
+                if keypoints is not None:
+                    court_d.draw_frame(frame, keypoints)
+            if number_d:
+                number_d.draw_frame(frame, index)
+            if control_d:
+                control_d.draw_frame(frame, index, team_ball_control)
+            if pass_d:
+                pass_d.draw_frame(frame, index, passes, interceptions)
+            if speed_d:
+                speed_d.draw_frame(
+                    frame,
+                    _at(player_tracks, index, {}),
+                    _at(dist_per_frame, index, {}),
+                    _at(speed_per_frame, index, {}))
+            if tactical_d:
+                tactical_d.draw_frame(
+                    frame, court_image, tactical_conv.width,
+                    tactical_conv.height, tactical_conv.key_points,
+                    _at(tactical_pos, index, {}),
+                    _at(player_assignment, index, {}),
+                    _at(ball_aquisition, index, -1))
+
+            writer.write(frame)
+            written += 1
+            # `frame` is rebound on the next iteration and the reader hands out
+            # a fresh buffer, so the drawn frame is released immediately.
+            if on_progress is not None and index % 20 == 0:
+                on_progress(index)
+    finally:
+        writer.release()
+
+    transcode_h264(tmp_avi, out_path, cfg["output_fps"])
+    return written
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -960,11 +1288,15 @@ def _render_results(r):
         m3.metric("Per analysed frame",
                   f"{detect_s / max(1, s.get('frames_detected', 1)):.2f} s")
         m4.metric("Device", s.get("device", "—"))
+        resolution = ""
+        if s.get("source_size") and s.get("processed_size"):
+            resolution = (f" Source {s['source_size']}, processed and written "
+                          f"at {s['processed_size']}.")
         st.caption(
             f"Detected on {s.get('frames_detected', 0)} of {r['total_frames']} "
             f"frames (stride {s.get('detect_stride', 1)}), court key-points on "
             f"{s.get('keypoint_frames', 0)} (every {s.get('keypoint_every', 1)}), "
-            f"at imgsz {s.get('imgsz', 640)}."
+            f"at imgsz {s.get('imgsz', 640)}.{resolution}"
         )
         with st.expander("Per-stage breakdown"):
             st.dataframe(
@@ -1082,12 +1414,7 @@ def render(sport=None):
             <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem;">MP4 · AVI · MOV · MKV</div>
         </div>""")
     else:
-        data = uploaded.getvalue()
-        fingerprint = video_fingerprint(data)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tmp.write(data)
-        tmp.close()
-        video_path = tmp.name
+        video_path, fingerprint = _stage_upload(uploaded)
         st.video(video_path)
 
     if video_path:
@@ -1097,12 +1424,29 @@ def render(sport=None):
                                       cfg["court_model"])
 
         # Tell the user what they're committing to before they commit to it.
-        cap = cv2.VideoCapture(video_path)
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cap.release()
+        from utils import get_video_info, scaled_size
+
+        src_w, src_h, src_fps, src_count = get_video_info(video_path)
+        n_frames = src_count or 0
         if cfg["max_seconds"]:
-            n_frames = min(n_frames, int(cfg["max_seconds"] * src_fps))
+            capped = int(cfg["max_seconds"] * src_fps)
+            n_frames = min(n_frames, capped) if n_frames else capped
+        hard_cap = int(MAX_ANALYSIS_SECONDS * src_fps)
+        trimmed = bool(n_frames and n_frames > hard_cap)
+        n_frames = min(n_frames or hard_cap, hard_cap)
+
+        scale = memory.fit_scale(src_w, src_h, cfg["max_long_side"])
+        proc_w, proc_h = scaled_size(src_w, src_h, scale)
+        if scale != 1.0:
+            st.caption(f"Source is {src_w}x{src_h}; it will be processed and "
+                       f"written out at {proc_w}x{proc_h} "
+                       f"({memory.frame_mb(proc_w, proc_h):.1f} MB per frame "
+                       f"instead of {memory.frame_mb(src_w, src_h):.1f} MB).")
+        if trimmed:
+            st.info(f"Only the first {MAX_ANALYSIS_SECONDS}s will be analysed "
+                    f"— that ceiling is what keeps the hosted app inside its "
+                    f"memory and disk budget.")
+
         est = estimate_runtime(n_frames, cfg["detect_stride"],
                                cfg["keypoint_every"], cfg["imgsz"],
                                cfg["backend"])
@@ -1130,10 +1474,21 @@ def render(sport=None):
                            f"roughly {eta}")
 
         if run_analysis:
+            # Drop the previous run before starting a new one: its per-frame
+            # track lists are the largest thing left in session state.
+            st.session_state.pop(STATE_KEY, None)
+            gc.collect()
             try:
                 results = _run_pipeline(video_path, cfg)
             except ImportError as exc:
                 st.error(f"Import error: {exc}")
+                return
+            except MemoryError:
+                gc.collect()
+                st.error(
+                    "Ran out of memory. Lower **Processing resolution**, cap "
+                    "**Analyse first N seconds**, or reduce **Detection batch "
+                    "size** in the sidebar, then try again.")
                 return
             st.session_state[STATE_KEY] = results
             st.success(f"✅ Analysis complete in **{results['elapsed']:.1f}s** · "

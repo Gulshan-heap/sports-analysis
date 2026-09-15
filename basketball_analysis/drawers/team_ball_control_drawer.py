@@ -54,13 +54,13 @@ class TeamBallControlDrawer:
         
         team_ball_control = self.get_team_ball_control(player_assignment,ball_aquisition)
 
-        output_video_frames= []
+        output_video_frames = []
         for frame_num, frame in enumerate(video_frames):
-            if frame_num == 0:
-                continue
-
-            frame_drawn = self.draw_frame(frame,frame_num,team_ball_control)
-            output_video_frames.append(frame_drawn)
+            # Every frame is emitted, frame 0 included. Skipping it used to
+            # drop it from the output entirely, which shortened the list by one
+            # and shifted every subsequent drawer's track lookup by a frame.
+            output_video_frames.append(
+                self.draw_frame(frame, frame_num, team_ball_control))
         return output_video_frames
     
     def draw_frame(self,frame,frame_num,team_ball_control):

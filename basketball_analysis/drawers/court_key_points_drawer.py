@@ -9,7 +9,8 @@ def _to_sv_keypoints(keypoints):
     Handing ultralytics' own `Keypoints` object straight to supervision only
     works on some version pairs — newer ultralytics dropped the `.visible`
     attribute that older supervision reaches for. Going through the raw xy
-    array is stable across both.
+    array is stable across both, and is also what
+    `CourtKeypointDetector.CourtKeypoints` stores.
     """
     if isinstance(keypoints, sv.KeyPoints):
         return keypoints
@@ -33,6 +34,35 @@ class CourtKeypointDrawer:
     """
     def __init__(self):
         self.keypoint_color = '#ff2c2c'
+        # Built once and reused. These used to be constructed inside draw(),
+        # which was fine for a whole-list call but wasteful once frames are
+        # streamed through draw_frame() one at a time.
+        self._vertex_annotator = sv.VertexAnnotator(
+            color=sv.Color.from_hex(self.keypoint_color),
+            radius=8)
+        self._label_annotator = sv.VertexLabelAnnotator(
+            color=sv.Color.from_hex(self.keypoint_color),
+            text_color=sv.Color.WHITE,
+            text_scale=0.5,
+            text_thickness=1)
+
+    def draw_frame(self, frame, frame_keypoints):
+        """
+        Draw one frame's court keypoints, in place.
+
+        Args:
+            frame (numpy.ndarray): The frame to annotate. Modified in place.
+            frame_keypoints: Keypoints for this frame.
+
+        Returns:
+            numpy.ndarray: The same frame, annotated.
+        """
+        keypoints = _to_sv_keypoints(frame_keypoints)
+        if keypoints.xy.size == 0:
+            return frame
+        frame = self._vertex_annotator.annotate(scene=frame, key_points=keypoints)
+        frame = self._label_annotator.annotate(scene=frame, key_points=keypoints)
+        return frame
 
     def draw(self, frames, court_keypoints):
         """
@@ -46,31 +76,5 @@ class CourtKeypointDrawer:
         Returns:
             list: A list of frames with keypoints drawn on them.
         """
-        vertex_annotator = sv.VertexAnnotator(
-            color=sv.Color.from_hex(self.keypoint_color),
-            radius=8)
-        
-        vertex_label_annotator = sv.VertexLabelAnnotator(
-            color=sv.Color.from_hex(self.keypoint_color),
-            text_color=sv.Color.WHITE,
-            text_scale=0.5,
-            text_thickness=1
-        )
-        
-        output_frames = []
-        for index,frame in enumerate(frames):
-            annotated_frame = frame.copy()
-
-            keypoints = _to_sv_keypoints(court_keypoints[index])
-            # Draw dots
-            annotated_frame = vertex_annotator.annotate(
-                scene=annotated_frame,
-                key_points=keypoints)
-            # Draw labels
-            annotated_frame = vertex_label_annotator.annotate(
-                scene=annotated_frame,
-                key_points=keypoints)
-
-            output_frames.append(annotated_frame)
-
-        return output_frames
+        return [self.draw_frame(frame.copy(), court_keypoints[index])
+                for index, frame in enumerate(frames)]

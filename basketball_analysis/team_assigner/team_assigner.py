@@ -103,40 +103,49 @@ class TeamAssigner:
         self.player_team_dict[player_id] = team_id
         return team_id
 
-    def get_player_teams_across_frames(self,video_frames,player_tracks,read_from_stub=False, stub_path=None):
+    def get_player_teams_across_frames(self, video_frames, player_tracks,
+                                       read_from_stub=False, stub_path=None,
+                                       expected_count=None):
         """
-        Processes all video frames to assign teams to players, with optional caching.
+        Processes video frames to assign teams to players, with optional caching.
 
         Args:
-            video_frames (list): List of video frames to process.
+            video_frames: Iterable of frames aligned with `player_tracks`. A
+                generator is fine and is the memory-cheap option — frames are
+                consumed in order and never retained.
             player_tracks (list): List of player tracking information for each frame.
             read_from_stub (bool): Whether to attempt reading cached results.
             stub_path (str): Path to the cache file.
+            expected_count (int, optional): Number of frames the iterable
+                yields; defaults to `len(video_frames)` when available.
 
         Returns:
             list: List of dictionaries mapping player IDs to team assignments for each frame.
         """
-        
-        player_assignment = read_stub(read_from_stub,stub_path)
+        if expected_count is None:
+            expected_count = (len(video_frames)
+                              if hasattr(video_frames, "__len__") else None)
+
+        player_assignment = read_stub(read_from_stub, stub_path)
         if player_assignment is not None:
-            if len(player_assignment) == len(video_frames):
+            if expected_count is None or len(player_assignment) == expected_count:
                 return player_assignment
 
         self.load_model()
 
-        player_assignment=[]
-        for frame_num, player_track in enumerate(player_tracks):        
+        player_assignment = []
+        # Zipped rather than indexed so a lazy frame reader can be passed in.
+        for frame_num, (frame, player_track) in enumerate(
+                zip(video_frames, player_tracks)):
             player_assignment.append({})
-            
-            if frame_num %50 ==0:
+
+            if frame_num % 50 == 0:
                 self.player_team_dict = {}
 
             for player_id, track in player_track.items():
-                team = self.get_player_team(video_frames[frame_num],   
-                                                    track['bbox'],
-                                                    player_id)
+                team = self.get_player_team(frame, track['bbox'], player_id)
                 player_assignment[frame_num][player_id] = team
-        
-        save_stub(stub_path,player_assignment)
+
+        save_stub(stub_path, player_assignment)
 
         return player_assignment

@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import sys 
 sys.path.append('../')
-from utils import read_stub, save_stub
+from utils import read_stub, save_stub, batched
 
 
 class BallTracker:
@@ -14,6 +14,11 @@ class BallTracker:
 
     This class provides methods to detect the ball in video frames, process detections
     in batches, and refine tracking results through filtering and interpolation.
+
+    Detection is consumed batch-by-batch: an ultralytics ``Results`` object
+    pins its input frame in ``.orig_img``, so keeping one per frame would cost
+    a second full copy of the video. See :class:`PlayerTracker` for the same
+    note.
     """
     def __init__(self, model_path, device=None, imgsz=None,
                  task=None, batch_size=20):
@@ -28,9 +33,18 @@ class BallTracker:
         self.imgsz = imgsz
         self.batch_size = batch_size
 
+    def _predict(self, frames):
+        """Run YOLO over one batch of frames."""
+        return self.model.predict(
+            frames, conf=0.5, device=self.device, verbose=False,
+            **({"imgsz": self.imgsz} if self.imgsz else {}))
+
     def detect_frames(self, frames):
         """
         Detect the ball in a sequence of frames using batch processing.
+
+        Retained for backwards compatibility; it materialises every ``Results``
+        object at once. Prefer :meth:`get_object_tracks`, which streams.
 
         Args:
             frames (list): List of video frames to process.
@@ -38,65 +52,70 @@ class BallTracker:
         Returns:
             list: YOLO detection results for each frame.
         """
-        batch_size = self.batch_size
-        detections = [] 
-        for i in range(0,len(frames),batch_size):
-            detections_batch = self.model.predict(
-                frames[i:i+batch_size], conf=0.5, device=self.device,
-                verbose=False, **({"imgsz": self.imgsz} if self.imgsz else {}))
-            detections += detections_batch
+        detections = []
+        for chunk in batched(frames, self.batch_size):
+            detections += self._predict(chunk)
         return detections
 
-    def get_object_tracks(self, frames, read_from_stub=False, stub_path=None):
+    def _track_from_detection(self, detection):
+        """Reduce one YOLO result to the single highest-confidence ball box."""
+        cls_names = detection.names
+        cls_names_inv = {v: k for k, v in cls_names.items()}
+
+        detection_supervision = sv.Detections.from_ultralytics(detection)
+
+        chosen_bbox = None
+        max_confidence = 0
+
+        for frame_detection in detection_supervision:
+            bbox = frame_detection[0].tolist()
+            cls_id = frame_detection[3]
+            confidence = frame_detection[2]
+
+            if cls_id == cls_names_inv['Ball']:
+                if max_confidence < confidence:
+                    chosen_bbox = bbox
+                    max_confidence = confidence
+
+        return {1: {"bbox": chosen_bbox}} if chosen_bbox is not None else {}
+
+    def get_object_tracks(self, frames, read_from_stub=False, stub_path=None,
+                          expected_count=None, on_progress=None):
         """
         Get ball tracking results for a sequence of frames with optional caching.
 
         Args:
-            frames (list): List of video frames to process.
+            frames: Iterable of video frames (a generator is fine — pass
+                ``expected_count`` with it so the cache stays length-checked).
             read_from_stub (bool): Whether to attempt reading cached results.
             stub_path (str): Path to the cache file.
+            expected_count (int, optional): Number of frames the iterable yields.
+            on_progress (callable, optional): Called with (done, expected).
 
         Returns:
             list: List of dictionaries containing ball tracking information for each frame.
         """
-        tracks = read_stub(read_from_stub,stub_path)
+        if expected_count is None:
+            expected_count = len(frames) if hasattr(frames, "__len__") else None
+
+        tracks = read_stub(read_from_stub, stub_path)
         if tracks is not None:
-            if len(tracks) == len(frames):
+            if expected_count is None or len(tracks) == expected_count:
                 return tracks
 
-        detections = self.detect_frames(frames)
+        tracks = []
+        for chunk in batched(frames, self.batch_size):
+            for detection in self._predict(chunk):
+                tracks.append(self._track_from_detection(detection))
+            if on_progress is not None:
+                on_progress(len(tracks), expected_count)
 
-        tracks=[]
+        save_stub(stub_path, tracks)
 
-        for frame_num, detection in enumerate(detections):
-            cls_names = detection.names
-            cls_names_inv = {v:k for k,v in cls_names.items()}
-
-            # Covert to supervision Detection format
-            detection_supervision = sv.Detections.from_ultralytics(detection)
-
-            tracks.append({})
-            chosen_bbox =None
-            max_confidence = 0
-            
-            for frame_detection in detection_supervision:
-                bbox = frame_detection[0].tolist()
-                cls_id = frame_detection[3]
-                confidence = frame_detection[2]
-                
-                if cls_id == cls_names_inv['Ball']:
-                    if max_confidence<confidence:
-                        chosen_bbox = bbox
-                        max_confidence = confidence
-
-            if chosen_bbox is not None:
-                tracks[frame_num][1] = {"bbox":chosen_bbox}
-
-        save_stub(stub_path,tracks)
-        
         return tracks
 
-    def remove_wrong_detections(self,ball_positions):
+    @staticmethod
+    def remove_wrong_detections(ball_positions):
         """
         Filter out incorrect ball detections based on maximum allowed movement distance.
 
@@ -132,7 +151,8 @@ class BallTracker:
 
         return ball_positions
 
-    def interpolate_ball_positions(self,ball_positions):
+    @staticmethod
+    def interpolate_ball_positions(ball_positions):
         """
         Interpolate missing ball positions to create smooth tracking results.
 

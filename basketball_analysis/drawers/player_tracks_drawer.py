@@ -21,9 +21,42 @@ class PlayerTracksDrawer:
         self.team_1_color=team_1_color
         self.team_2_color=team_2_color
 
+    def draw_frame(self, frame, player_dict, player_assignment_for_frame,
+                   player_id_has_ball):
+        """
+        Draw one frame's player tracks, in place.
+
+        Args:
+            frame (numpy.ndarray): The frame to annotate. Modified in place.
+            player_dict (dict): {track_id: {'bbox': [...]}} for this frame.
+            player_assignment_for_frame (dict): {track_id: team_id} for this frame.
+            player_id_has_ball: Track ID holding the ball, or -1.
+
+        Returns:
+            numpy.ndarray: The same frame, annotated.
+        """
+        for track_id, player in player_dict.items():
+            team_id = player_assignment_for_frame.get(track_id, self.default_player_team_id)
+
+            if team_id == 1:
+                color = self.team_1_color
+            else:
+                color = self.team_2_color
+
+            frame = draw_ellipse(frame, player["bbox"], color, track_id)
+
+            if track_id == player_id_has_ball:
+                frame = draw_traingle(frame, player["bbox"], (0, 0, 255))
+
+        return frame
+
     def draw(self,video_frames,tracks,player_assignment,ball_aquisition):
         """
         Draw player tracks and ball possession indicators on a list of video frames.
+
+        Note: this materialises a second copy of every frame. The Streamlit app
+        streams one frame at a time through :meth:`draw_frame` instead; this
+        list form is kept for the `main.py` CLI.
 
         Args:
             video_frames (list): A list of frames (as NumPy arrays or image objects) on which to draw.
@@ -39,29 +72,11 @@ class PlayerTracksDrawer:
 
         output_video_frames= []
         for frame_num, frame in enumerate(video_frames):
-            frame = frame.copy()
-
-            player_dict = tracks[frame_num]
-
-            player_assignment_for_frame = player_assignment[frame_num]
-
-            player_id_has_ball = ball_aquisition[frame_num]
-
-            # Draw Players
-            for track_id, player in player_dict.items():
-                team_id = player_assignment_for_frame.get(track_id,self.default_player_team_id)
-
-                if team_id == 1:
-                    color = self.team_1_color
-                else:
-                    color = self.team_2_color
-
-                frame = draw_ellipse(frame, player["bbox"],color, track_id)
-
-                if track_id == player_id_has_ball:
-                    frame = draw_traingle(frame, player["bbox"],(0,0,255))
-
-            output_video_frames.append(frame)
+            output_video_frames.append(self.draw_frame(
+                frame.copy(),
+                tracks[frame_num],
+                player_assignment[frame_num],
+                ball_aquisition[frame_num],
+            ))
 
         return output_video_frames
-        

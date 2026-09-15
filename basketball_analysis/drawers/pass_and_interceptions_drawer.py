@@ -58,11 +58,9 @@ class PassInterceptionDrawer:
         """
         output_video_frames = []
         for frame_num, frame in enumerate(video_frames):
-            if frame_num == 0:
-                continue
-            
-            frame_drawn = self.draw_frame(frame, frame_num, passes, interceptions)
-            output_video_frames.append(frame_drawn)
+            # Frame 0 is emitted too — see the note in TeamBallControlDrawer.
+            output_video_frames.append(
+                self.draw_frame(frame, frame_num, passes, interceptions))
         return output_video_frames
     
     def draw_frame(self, frame, frame_num, passes, interceptions):
