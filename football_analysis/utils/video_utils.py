@@ -171,7 +171,13 @@ def convert_to_h264(input_path, output_path, fps=None, overwrite=True,
         if fps:
             cmd += ["-r", str(fps)]
         cmd.append(str(output_path))
-        subprocess.run(cmd, check=True, capture_output=True)
+        done = subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace")
+        if done.returncode != 0:
+            # CalledProcessError stringifies to just the exit code, which tells
+            # nobody anything. Carry the tail of ffmpeg's own diagnostics.
+            tail = (done.stderr or "").strip().splitlines()[-4:]
+            raise RuntimeError("ffmpeg failed: " + " | ".join(tail))
         return output_path
 
     # Fallback: write H.264 directly with PyAV.
@@ -193,6 +199,13 @@ def convert_to_h264(input_path, output_path, fps=None, overwrite=True,
     width = height = None
     for frame in container_in.decode(video=0):
         img = frame.to_ndarray(format="bgr24")
+        if max_long_side:
+            long_side = max(img.shape[1], img.shape[0])
+            if long_side > max_long_side:
+                factor = max_long_side / float(long_side)
+                img = cv2.resize(img, (max(2, int(img.shape[1] * factor)),
+                                       max(2, int(img.shape[0] * factor))),
+                                 interpolation=cv2.INTER_AREA)
         h, w = img.shape[:2]
         if first:
             # yuv420p requires even dimensions; pad an odd frame by 1px.

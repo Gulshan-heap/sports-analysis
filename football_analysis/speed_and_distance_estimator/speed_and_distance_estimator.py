@@ -8,11 +8,15 @@ class SpeedAndDistance_Estimator():
         # Streaming state: index of the next window start to process.
         self._next_window = 0
         self._total_distance = {}
+        # Last speed/distance computed for each track, used to label frames
+        # whose own window has not closed yet — see annotate_frame().
+        self._last_seen = {}
 
     def reset(self):
         """Forget streaming state so a new video can be processed."""
         self._next_window = 0
         self._total_distance = {}
+        self._last_seen = {}
     
     def add_speed_and_distance_to_tracks(self,tracks):
         total_distance= {}
@@ -123,18 +127,35 @@ class SpeedAndDistance_Estimator():
                 tracks[object][frame_num_batch][track_id]['speed'] = speed_km_per_hour
                 tracks[object][frame_num_batch][track_id]['distance'] = self._total_distance[object][track_id]
 
+            self._last_seen.setdefault(object, {})[track_id] = (
+                speed_km_per_hour, self._total_distance[object][track_id])
+
     def annotate_frame(self, frame, players):
-        """Draw speed/distance labels for ONE frame (scale aware)."""
+        """Draw speed/distance labels for ONE frame (scale aware).
+
+        The caller annotates each frame as soon as it is tracked, but speed is
+        a windowed quantity: `update()` can only fill in a frame once the
+        window containing it has closed, which is several frames later. The
+        frame being drawn therefore never carries its own speed yet, and the
+        labels silently never appeared — every player hit the `continue`
+        below, while the CSV (written after `finalize()`) looked correct.
+
+        So fall back to each track's most recent computed values. That is the
+        same number the batch path would have drawn here: it assigns a
+        window's speed to every frame in that window.
+        """
         h, w = frame.shape[:2]
         s = max(0.6, min(1.6, min(h, w) / 720.0))
         font_scale = max(0.4, min(0.7, 0.5 * s))
         thickness = max(1, int(round(s)))
 
-        for _, track_info in players.items():
-            if "speed" not in track_info:
-                continue
+        last_seen = self._last_seen.get("players", {})
+
+        for track_id, track_info in players.items():
             speed = track_info.get('speed')
             distance = track_info.get('distance')
+            if speed is None or distance is None:
+                speed, distance = last_seen.get(track_id, (None, None))
             if speed is None or distance is None:
                 continue
 

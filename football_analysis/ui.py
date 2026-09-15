@@ -581,6 +581,8 @@ def _run_pipeline(input_path, video_name, cfg, calib_corners):
             "backend": accel.label_for(backend),
             "imgsz": cfg["imgsz"],
             "detect_stride": cfg.get("detect_stride") or 1,
+            # Carried so a later preview rebuild encodes at the same rate.
+            "fps": cfg.get("fps"),
         },
     }
 
@@ -908,37 +910,67 @@ def _render_frame_explorer(r, df):
     </div>""")
 
 
-def _render_video(r):
-    """Show the annotated video, or say why it cannot be shown.
+def ensure_browser_preview(r):
+    """Return (playable_path, error) for this result, transcoding if needed.
 
-    Older runs in session state predate the playability check, so the codec is
-    verified here too rather than trusted from the result dict.
+    Rather than giving up when the stored preview is not H.264, build one now
+    from whichever render exists. That covers a first-pass transcode that
+    failed, and results still sitting in session state from before the preview
+    was verified at all — those recorded the pipeline's raw MPEG-4 output as
+    the preview, which no browser will play.
+
+    The rebuilt file is written next to the others and reused on later reruns,
+    so the transcode happens at most once per run.
     """
-    from utils import is_browser_playable, probe_codec
+    from utils import convert_to_h264, is_browser_playable
 
-    path = r.get("h264_out")
-    if not path or not os.path.exists(path):
-        st.warning("The annotated video was not produced. The **Export** "
-                   "section below still has the tracked data.")
-        return
+    stored = r.get("h264_out")
+    if stored and is_browser_playable(stored):
+        return stored, None
 
-    if r.get("playable") or is_browser_playable(path):
+    sources = [p for p in (r.get("raw_out"), stored) if p and os.path.exists(p)]
+    if not sources:
+        return None, "no rendered video was produced"
+
+    source = sources[0]
+    repaired = os.path.splitext(source)[0] + "_web.mp4"
+
+    # Reuse an earlier repair unless the render has moved on since.
+    if is_browser_playable(repaired) and \
+            os.path.getmtime(repaired) >= os.path.getmtime(source):
+        return repaired, None
+
+    try:
+        with st.spinner("Preparing a browser-playable preview…"):
+            convert_to_h264(source, repaired,
+                            fps=(r.get("settings") or {}).get("fps"),
+                            max_long_side=PREVIEW_LONG_SIDE)
+    except Exception as exc:
+        return None, str(exc)
+
+    if not is_browser_playable(repaired):
+        return None, "the encoder produced a file the browser cannot decode"
+    return repaired, None
+
+
+def _render_video(r):
+    """Show the annotated video, rebuilding the preview if it is not playable."""
+    path, error = ensure_browser_preview(r)
+
+    if path:
         st.video(path)
         st.caption(f"{os.path.getsize(path) / 1e6:.1f} MB preview · "
                    f"full-resolution render under Export below.")
         return
 
-    # A file exists but the browser will not decode it — almost always because
-    # the H.264 transcode failed and this is OpenCV's mp4v output.
-    reason = r.get("preview_error") or (
-        f"it is {probe_codec(path) or 'in an unknown format'}")
+    reason = error or r.get("preview_error") or "the preview could not be built"
     st.warning(
-        f"The annotated video cannot be previewed in the browser because "
-        f"{reason}.\n\n"
-        f"The file itself is fine — download it under **Export** below and it "
-        f"will play in VLC or any desktop player. In-browser playback needs "
-        f"H.264, which requires `ffmpeg` on the server: check that `ffmpeg` "
-        f"is listed in `packages.txt`.")
+        f"The annotated video could not be prepared for in-browser playback "
+        f"({reason}).\n\n"
+        f"The render itself is fine — download it under **Export** below and "
+        f"it will play in VLC or any desktop player. In-browser playback "
+        f"needs H.264, which requires `ffmpeg` on the server: check that "
+        f"`ffmpeg` is listed in `packages.txt`.")
 
 
 def _render_results(r):
