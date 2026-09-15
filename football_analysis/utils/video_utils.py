@@ -79,21 +79,90 @@ def _fourcc_for_path(path):
     }.get(ext, 'XVID')
 
 
-def convert_to_h264(input_path, output_path, fps=None, overwrite=True):
+# Codecs a browser will actually decode. OpenCV writes the pipeline's raw
+# output with the "mp4v" fourcc, which is MPEG-4 Part 2 — a perfectly valid
+# .mp4 that Chrome, Firefox and Safari all refuse to play. Handing one of
+# those to st.video() produces a player that loads and then shows nothing,
+# which is indistinguishable from "the video is broken".
+BROWSER_CODECS = ("h264", "avc1", "vp8", "vp9", "av1")
+
+
+def probe_codec(path):
+    """Best-effort video codec name for `path`, or None if it cannot be read.
+
+    Uses ffprobe when it is on PATH, and otherwise sniffs the sample-description
+    box in the file header, which is enough to tell avc1 from mp4v.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffprobe"):
+        try:
+            done = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                check=True, capture_output=True, text=True, timeout=30)
+            name = done.stdout.strip().splitlines()
+            if name:
+                return name[0].strip().lower()
+        except Exception:
+            pass
+
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(1 << 20)
+    except OSError:
+        return None
+    for tag in (b"avc1", b"hvc1", b"hev1", b"vp09", b"av01", b"mp4v"):
+        if tag in head:
+            return tag.decode()
+    return None
+
+
+def is_browser_playable(path):
+    """True when a browser can be expected to decode this file."""
+    import os
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    codec = probe_codec(path)
+    return codec is not None and codec in BROWSER_CODECS
+
+
+def convert_to_h264(input_path, output_path, fps=None, overwrite=True,
+                    max_long_side=None):
     """Transcode a video to a browser-playable H.264 .mp4.
 
     Uses the system ffmpeg first (handles odd dimensions, pixel formats and
     container subtleties correctly), falling back to PyAV if ffmpeg is missing.
+
+    `max_long_side` caps the preview's long edge. That matters because
+    st.video() hands the whole file to the browser through Streamlit's media
+    server, which holds it in memory: a 30-second 1080p annotation is ~22 MB,
+    and on a small container that is both slow and risky. The full-resolution
+    render is still written separately and offered for download.
     """
     import subprocess
     import shutil
 
     # Prefer ffmpeg on PATH for robustness.
     if shutil.which("ffmpeg"):
+        # yuv420p requires even dimensions, so any scaling — including none —
+        # is rounded down to an even number of pixels. Without this an
+        # odd-sized source fails the encode outright, and the caller is left
+        # falling back to a file the browser cannot play.
+        if max_long_side:
+            scale = (f"scale='if(gt(iw,ih),min({max_long_side},iw),-2)':"
+                     f"'if(gt(iw,ih),-2,min({max_long_side},ih))'")
+            vf = f"{scale},scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        else:
+            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
         cmd = [
             "ffmpeg", "-y" if overwrite else "-n",
             "-i", str(input_path),
             "-c:v", "libx264",
+            "-vf", vf,
             "-pix_fmt", "yuv420p",
             "-preset", "veryfast",
             "-crf", "23",

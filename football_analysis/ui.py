@@ -73,6 +73,12 @@ def ensure_model_ready(local_path, url):
 # enough to fill a small host's disk.
 MAX_KEPT_UPLOADS = 3
 
+# Long edge of the in-browser preview. st.video() serves the whole file
+# through Streamlit's media server, which holds it in memory — a 30-second
+# 1080p annotation is ~22 MB per viewer. The full-resolution render is
+# untouched and still offered under Export.
+PREVIEW_LONG_SIDE = 1280
+
 
 def save_upload(uploaded_file):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -533,12 +539,26 @@ def _run_pipeline(input_path, video_name, cfg, calib_corners):
         return None
 
     show(96, "🎬 Encoding H.264 for browser playback…")
+    from utils import convert_to_h264, is_browser_playable, probe_codec
+
+    # The pipeline writes raw_out with OpenCV's "mp4v" fourcc, i.e. MPEG-4
+    # Part 2. That is a valid .mp4 that no browser will decode, so falling
+    # back to it on a failed transcode gave a player that loaded and then
+    # showed nothing. Now the preview is only offered once it is verified
+    # playable, and the failure is stated instead of being shown as a blank
+    # video element.
+    preview_error = None
     try:
-        from utils import convert_to_h264
-        convert_to_h264(raw_out, h264_out, fps=cfg.get("fps"))
-    except Exception as exc:                # fall back to showing the raw file
-        st.warning(f"Could not create H.264 preview ({exc}). Showing raw instead.")
-        h264_out = raw_out
+        convert_to_h264(raw_out, h264_out, fps=cfg.get("fps"),
+                        max_long_side=PREVIEW_LONG_SIDE)
+    except Exception as exc:
+        preview_error = str(exc)
+
+    playable = is_browser_playable(h264_out)
+    if not playable:
+        preview_error = preview_error or (
+            f"the encoder produced a {probe_codec(h264_out) or 'unreadable'} "
+            f"file, which browsers cannot play")
 
     progress.progress(100)
     progress.empty()
@@ -547,6 +567,8 @@ def _run_pipeline(input_path, video_name, cfg, calib_corners):
     return {
         "raw_out": raw_out,
         "h264_out": h264_out,
+        "playable": playable,
+        "preview_error": preview_error,
         "csv_path": csv_path,
         "calib_path": calib_path,
         "heatmaps_dir": heatmaps_dir if cfg["do_heatmaps"] else None,
@@ -601,12 +623,44 @@ def _speed_sanity_check(df):
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
+def _render_video(r):
+    """Show the annotated video, or say why it cannot be shown.
+
+    Older runs in session state predate the playability check, so the codec is
+    verified here too rather than trusted from the result dict.
+    """
+    from utils import is_browser_playable, probe_codec
+
+    path = r.get("h264_out")
+    if not path or not os.path.exists(path):
+        st.warning("The annotated video was not produced. The **Export** "
+                   "section below still has the tracked data.")
+        return
+
+    if r.get("playable") or is_browser_playable(path):
+        st.video(path)
+        st.caption(f"{os.path.getsize(path) / 1e6:.1f} MB preview · "
+                   f"full-resolution render under Export below.")
+        return
+
+    # A file exists but the browser will not decode it — almost always because
+    # the H.264 transcode failed and this is OpenCV's mp4v output.
+    reason = r.get("preview_error") or (
+        f"it is {probe_codec(path) or 'in an unknown format'}")
+    st.warning(
+        f"The annotated video cannot be previewed in the browser because "
+        f"{reason}.\n\n"
+        f"The file itself is fine — download it under **Export** below and it "
+        f"will play in VLC or any desktop player. In-browser playback needs "
+        f"H.264, which requires `ffmpeg` on the server: check that `ffmpeg` "
+        f"is listed in `packages.txt`.")
+
+
 def _render_results(r):
     stats = r.get("stats") or {}
 
     sec("📹", "Analysed Video")
-    if os.path.exists(r["h264_out"]):
-        st.video(r["h264_out"])
+    _render_video(r)
 
     if stats:
         sec("📊", "Match Overview")
@@ -648,15 +702,6 @@ def _render_results(r):
                 f"{cfg_used.get('backend', '—')} · imgsz "
                 f"{cfg_used.get('imgsz', 640)} · detect stride "
                 f"{cfg_used.get('detect_stride', 1)}")
-
-        with st.expander("Full run stats"):
-            st.json(stats)
-
-    # The raw pipeline log is available but never shown by default — it is
-    # mostly library warnings the user cannot act on.
-    if r.get("log"):
-        with st.expander("Pipeline log"):
-            st.code("\n".join(r["log"][-200:]), language="text")
 
     # ── per-frame data ───────────────────────────────────────────────────────
     if os.path.exists(r["csv_path"]):
