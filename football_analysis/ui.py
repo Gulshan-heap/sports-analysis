@@ -181,12 +181,15 @@ def is_noise(line):
 
 
 @st.cache_data(show_spinner=False)
-def detect_pitch(video_path, _stamp):
+def detect_pitch(video_path, stamp):
     """
     Automatic pitch detection, cached per (video, mtime).
 
-    `_stamp` is only there to key the cache on file identity; detection reads
-    several frames, so it must not rerun on every widget interaction.
+    `stamp` is only there to key the cache on file identity; detection reads
+    several frames, so it must not rerun on every widget interaction. It is
+    deliberately not underscore-prefixed — Streamlit drops underscore-prefixed
+    arguments from the cache key, which made the stamp a no-op and returned a
+    previous video's corners whenever an upload reused a filename.
     """
     import pitch_calibration as pitch
     corners, confidence, info = pitch.detect_from_video(video_path, samples=5)
@@ -623,6 +626,288 @@ def _speed_sanity_check(df):
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-PLAYER ANALYTICS
+#
+# Everything below is derived from the per-frame CSV the pipeline already
+# writes, so it costs one file read rather than keeping tracking state in
+# session memory. Column semantics, from analytics.export_frame_data_csv:
+#
+#   frame            index into the processed frames — the same index as the
+#                    annotated video, so the frame explorer can seek by it
+#   speed            km/h over a rolling 5-frame window, repeated across the
+#                    frames of that window
+#   distance         CUMULATIVE metres for that player up to this frame, not a
+#                    per-frame delta. A player's total is therefore max(),
+#                    never sum() — summing overcounts by the window length.
+# ─────────────────────────────────────────────────────────────────────────────
+TEAM_COLORS = ["#e94560", "#4a90e2"]
+TEAM_LABELS = ["🔴 Team 1", "🔵 Team 2"]
+
+
+@st.cache_data(show_spinner=False)
+def _load_tracking(csv_path, mtime):
+    """Read the per-frame CSV once per (path, modification time).
+
+    Streamlit reruns the whole script on every widget interaction, and these
+    panels all need the same frame; without the cache, dragging the frame
+    explorer would re-parse a 15k-row CSV on every step. `mtime` is unused in
+    the body but must NOT be underscore-prefixed: Streamlit excludes
+    underscore-prefixed arguments from the cache key, so `_mtime` would be
+    ignored and a re-run of the same video would serve the previous run's data.
+    """
+    return pd.read_csv(csv_path)
+
+
+def load_tracking(csv_path):
+    """Cached tracking frame for `csv_path`, or None when it is unusable."""
+    try:
+        return _load_tracking(csv_path, os.path.getmtime(csv_path))
+    except Exception:
+        return None
+
+
+def _team_label(team):
+    try:
+        return TEAM_LABELS[int(team) - 1]
+    except (ValueError, TypeError, IndexError):
+        return "Unknown"
+
+
+def player_summary(df):
+    """One row per player: team, total distance, top speed, frames tracked."""
+    if df is None or df.empty or "player_id" not in df.columns:
+        return pd.DataFrame()
+
+    grouped = df.groupby("player_id").agg(
+        team=("team", lambda s: s.mode().iat[0] if not s.mode().empty else None),
+        dist=("distance", "max"),      # cumulative column — see the note above
+        spd=("speed", "max"),
+        frames=("frame", "nunique"),
+    ).reset_index()
+
+    grouped["dist"] = grouped["dist"].fillna(0.0)
+    grouped["spd"] = grouped["spd"].fillna(0.0)
+    grouped["team_label"] = grouped["team"].map(_team_label)
+    return grouped.sort_values("dist", ascending=False).reset_index(drop=True)
+
+
+def _dark(chart, height):
+    """The app's chart styling, applied identically to every panel."""
+    return (chart
+            .properties(height=height)
+            .configure_view(strokeWidth=0, fill="#0d1117")
+            .configure_axis(gridColor="#21262d", labelColor="#8b949e",
+                            titleColor="#8b949e", domainColor="#21262d")
+            .configure_legend(labelColor="#8b949e", titleColor="#8b949e",
+                              fillColor="#0d1117", strokeColor="#21262d",
+                              padding=8))
+
+
+def read_frame_at(video_path, index):
+    """Pull a single frame out of a rendered video.
+
+    Seeking the encoded file per slider move costs a few milliseconds and
+    keeps nothing in memory — the alternative, holding the decoded frames, is
+    what made the basketball page unusable on a small container.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    return frame if ok else None
+
+
+def _scrub_source(r):
+    """Which file the frame explorer should seek.
+
+    The browser preview is downscaled, so the full-resolution render is
+    preferred for scrubbing; its MPEG-4 codec is no obstacle to OpenCV, only
+    to browsers.
+    """
+    for key in ("raw_out", "h264_out"):
+        path = r.get(key)
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def _render_ball_control(df):
+    """Rolling share of possession across the match."""
+    import altair as alt
+
+    per_frame = df.groupby("frame")["team_in_control"].first()
+    if per_frame.empty:
+        return
+
+    total = int(per_frame.index.max()) + 1
+    # Aim for ~100 points whatever the clip length, so a three-minute match
+    # does not turn into a few thousand slivers.
+    window = max(10, total // 100)
+
+    rows = []
+    for start in range(0, total, window):
+        segment = per_frame.loc[start:start + window - 1]
+        t1 = int((segment == 1).sum())
+        t2 = int((segment == 2).sum())
+        if t1 + t2 == 0:
+            continue
+        rows.append({"frame": start,
+                     "Team 1": round(100 * t1 / (t1 + t2)),
+                     "Team 2": round(100 * t2 / (t1 + t2))})
+    if not rows:
+        return
+
+    sec("⏱️", "Ball Control Over Time")
+    melted = pd.DataFrame(rows).melt("frame", var_name="team", value_name="pct")
+    st.altair_chart(
+        _dark(
+            alt.Chart(melted)
+            .mark_area(opacity=0.75, interpolate="monotone")
+            .encode(
+                x=alt.X("frame:Q", title="Frame"),
+                y=alt.Y("pct:Q", stack="normalize",
+                        axis=alt.Axis(format="%", title="Ball Control")),
+                color=alt.Color("team:N",
+                                scale=alt.Scale(domain=["Team 1", "Team 2"],
+                                                range=TEAM_COLORS),
+                                legend=alt.Legend(orient="top-right")),
+                tooltip=["frame:Q", "team:N", "pct:Q"],
+            ), 200),
+        use_container_width=True)
+    st.caption(f"Possession share per {window}-frame window.")
+
+
+def _render_player_panels(summary):
+    """Player table plus the distance and speed bar charts."""
+    import altair as alt
+
+    sec("🏃", "Player Performance")
+
+    # ByteTrack splits a player into a new ID whenever it loses them, so a
+    # match typically yields far more IDs than players — most of them
+    # fragments seen for a handful of frames. Ranking by distance and showing
+    # the top N keeps the charts readable; the full set is in the CSV.
+    total_players = len(summary)
+    default_n = min(15, total_players)
+    top_n = default_n
+    if total_players > 5:
+        top_n = st.slider(
+            "Players shown (ranked by distance covered)",
+            5, total_players, default_n, key="fb_top_n",
+            help="Tracking assigns a new ID whenever a player is lost and "
+                 "re-found, so most IDs are short fragments. The full, "
+                 "unfiltered data is in the CSV under Export.")
+
+    shown = summary.head(top_n).copy()
+
+    table = pd.DataFrame({
+        "Player ID": shown["player_id"],
+        "Team": shown["team_label"],
+        "Distance (m)": shown["dist"].round(2),
+        "Max Speed (km/h)": shown["spd"].round(1),
+        "Active Frames": shown["frames"],
+    }).reset_index(drop=True)
+
+    st.dataframe(
+        table.style
+             .background_gradient(subset=["Distance (m)"], cmap="RdYlGn")
+             .background_gradient(subset=["Max Speed (km/h)"], cmap="RdYlGn"),
+        use_container_width=True, hide_index=True)
+    st.caption(f"Showing {len(shown)} of {total_players} tracked IDs.")
+
+    chart_df = shown.assign(pid=shown["player_id"].astype(str))
+
+    sec("📈", "Distance by Player")
+    st.altair_chart(
+        _dark(
+            alt.Chart(chart_df)
+            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+            .encode(
+                x=alt.X("pid:N", sort="-y", title="Player ID",
+                        axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("dist:Q", title="Distance (m)"),
+                color=alt.Color("team_label:N", title="Team",
+                                scale=alt.Scale(domain=TEAM_LABELS,
+                                                range=TEAM_COLORS),
+                                legend=alt.Legend(orient="top-right")),
+                tooltip=[
+                    alt.Tooltip("pid:N", title="Player"),
+                    alt.Tooltip("team_label:N", title="Team"),
+                    alt.Tooltip("dist:Q", title="Distance (m)", format=".2f"),
+                    alt.Tooltip("spd:Q", title="Max Speed (km/h)", format=".1f"),
+                ],
+            ), 280),
+        use_container_width=True)
+
+    sec("⚡", "Max Speed by Player")
+    st.altair_chart(
+        _dark(
+            alt.Chart(chart_df)
+            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+            .encode(
+                x=alt.X("pid:N", sort="-y", title="Player ID",
+                        axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("spd:Q", title="Max Speed (km/h)"),
+                color=alt.Color("team_label:N",
+                                scale=alt.Scale(domain=TEAM_LABELS,
+                                                range=TEAM_COLORS),
+                                legend=None),
+                tooltip=[alt.Tooltip("pid:N", title="Player"),
+                         alt.Tooltip("spd:Q", title="Max Speed (km/h)",
+                                     format=".1f")],
+            ), 230),
+        use_container_width=True)
+
+
+def _render_frame_explorer(r, df):
+    """Scrub the annotated video and read off that frame's state."""
+    source = _scrub_source(r)
+    if not source or df is None or df.empty:
+        return
+
+    frames = df["frame"].max()
+    if pd.isna(frames) or frames < 1:
+        return
+    max_f = int(frames)
+
+    sec("🔎", "Frame Explorer")
+    frame_idx = st.slider("Scrub through frames", 0, max_f, 0,
+                          label_visibility="collapsed", key="fb_scrub")
+
+    frame = read_frame_at(source, frame_idx)
+    if frame is not None:
+        st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                 use_container_width=True)
+
+    rows = df[df["frame"] == frame_idx]
+    control = rows["team_in_control"].iloc[0] if not rows.empty else None
+    holders = rows[rows["has_ball"] == True]["player_id"].tolist()  # noqa: E712
+
+    holder_str = f"Player {int(holders[0])}" if holders else "—"
+    control_str = _team_label(control) if control in (1, 2) else "—"
+    fastest = "—"
+    if not rows.empty and rows["speed"].notna().any():
+        top = rows.loc[rows["speed"].idxmax()]
+        fastest = f"Player {int(top['player_id'])} · {top['speed']:.1f} km/h"
+
+    html(f"""
+    <div class="frame-meta">
+        <div class="fm-item"><div class="fm-label">Frame</div>
+            <div class="fm-value">{frame_idx} / {max_f}</div></div>
+        <div class="fm-item"><div class="fm-label">Players on frame</div>
+            <div class="fm-value">{len(rows)}</div></div>
+        <div class="fm-item"><div class="fm-label">Ball held by</div>
+            <div class="fm-value">{holder_str}</div></div>
+        <div class="fm-item"><div class="fm-label">Team in possession</div>
+            <div class="fm-value">{control_str}</div></div>
+        <div class="fm-item"><div class="fm-label">Fastest this frame</div>
+            <div class="fm-value">{fastest}</div></div>
+    </div>""")
+
+
 def _render_video(r):
     """Show the annotated video, or say why it cannot be shown.
 
@@ -703,17 +988,28 @@ def _render_results(r):
                 f"{cfg_used.get('imgsz', 640)} · detect stride "
                 f"{cfg_used.get('detect_stride', 1)}")
 
-    # ── per-frame data ───────────────────────────────────────────────────────
-    if os.path.exists(r["csv_path"]):
+    # ── per-player analytics, all derived from the one CSV read ─────────────
+    df = None
+    if r.get("csv_path") and os.path.exists(r["csv_path"]):
+        df = load_tracking(r["csv_path"])
+
+    if df is not None and not df.empty:
+        _speed_sanity_check(df)
+        _render_ball_control(df)
+
+        summary = player_summary(df)
+        if not summary.empty:
+            _render_player_panels(summary)
+
+        _render_frame_explorer(r, df)
+
         sec("📈", "Tracked Data")
-        try:
-            df = pd.read_csv(r["csv_path"])
-            _speed_sanity_check(df)
-            st.dataframe(df.head(500), use_container_width=True, hide_index=True)
-            st.caption(f"Showing the first {min(len(df), 500):,} of {len(df):,} rows "
-                       f"— download the full CSV below.")
-        except Exception as exc:
-            st.warning(f"Could not preview the CSV ({exc}).")
+        st.dataframe(df.head(500), use_container_width=True, hide_index=True)
+        st.caption(f"Showing the first {min(len(df), 500):,} of {len(df):,} rows "
+                   f"— download the full CSV below.")
+    elif r.get("csv_path") and os.path.exists(r["csv_path"]):
+        st.warning("Could not read the tracked data CSV, so the per-player "
+                   "panels are unavailable.")
 
     # ── downloads ────────────────────────────────────────────────────────────
     sec("⬇️", "Export")
